@@ -438,7 +438,7 @@ def create_trending_embed(threads: List[Dict], forum_name: str, hours: int) -> d
     )
     
     # Add The Coli logo as thumbnail
-    embed.set_thumbnail(url="https://www.thecoli.com/styles/default/xenforo/logo.png")
+    embed.set_thumbnail(url="https://raw.githubusercontent.com/breakfussclub/colibot/main/assets/colibot_logo.png")
     
     if not threads:
         embed.description = f"No threads found in the last {hours} hours."
@@ -461,7 +461,7 @@ def create_trending_embed(threads: List[Dict], forum_name: str, hours: int) -> d
             inline=False
         )
     
-    embed.set_footer(text="The Coli • Updates daily", icon_url="https://www.thecoli.com/styles/default/xenforo/logo.png")
+    embed.set_footer(text="The Coli • Updates daily", icon_url="https://raw.githubusercontent.com/breakfussclub/colibot/main/assets/colibot_logo.png")
     return embed
 
 
@@ -475,7 +475,7 @@ def create_newest_embed(threads: List[Dict], forum_name: str, hours: int) -> dis
     )
     
     # Add The Coli logo as thumbnail
-    embed.set_thumbnail(url="https://www.thecoli.com/styles/default/xenforo/logo.png")
+    embed.set_thumbnail(url="https://raw.githubusercontent.com/breakfussclub/colibot/main/assets/colibot_logo.png")
     
     if not threads:
         embed.description = f"No new threads in the last {hours} hours."
@@ -491,7 +491,7 @@ def create_newest_embed(threads: List[Dict], forum_name: str, hours: int) -> dis
             inline=False
         )
     
-    embed.set_footer(text="The Coli • Updates daily", icon_url="https://www.thecoli.com/styles/default/xenforo/logo.png")
+    embed.set_footer(text="The Coli • Updates daily", icon_url="https://raw.githubusercontent.com/breakfussclub/colibot/main/assets/colibot_logo.png")
     return embed
 
 

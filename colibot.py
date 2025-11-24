@@ -1,5 +1,6 @@
 import discord
-from discord.ext import commands, tasks
+from discord import app_commands
+from discord.ext import tasks
 import aiohttp
 from bs4 import BeautifulSoup
 import os
@@ -18,6 +19,7 @@ logger = logging.getLogger('ColiBot')
 # Environment variables
 DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
 CHANNEL_ID = int(os.getenv('CHANNEL_ID'))
+GUILD_ID = int(os.getenv('GUILD_ID'))  # Guild ID for slash command registration
 POPULAR_POST_TIME = os.getenv('POPULAR_POST_TIME', '09:00')  # Format: HH:MM
 NEWEST_POST_TIME = os.getenv('NEWEST_POST_TIME', '18:00')    # Format: HH:MM
 FORUM_URLS = os.getenv('FORUM_URLS', 'https://www.thecoli.com/forums/the-locker-room.6/').split(',')
@@ -25,7 +27,8 @@ FORUM_URLS = os.getenv('FORUM_URLS', 'https://www.thecoli.com/forums/the-locker-
 # Bot setup
 intents = discord.Intents.default()
 intents.message_content = True
-bot = commands.Bot(command_prefix='!', intents=intents)
+bot = discord.Client(intents=intents)
+tree = app_commands.CommandTree(bot)
 
 
 class ForumScraper:
@@ -204,7 +207,7 @@ def create_popular_embed(threads: List[Dict], forum_name: str) -> discord.Embed:
             inline=False
         )
     
-    embed.set_footer(text="Updates daily")
+    embed.set_footer(text="ColiBot • Updates daily")
     return embed
 
 
@@ -230,7 +233,7 @@ def create_newest_embed(threads: List[Dict], forum_name: str) -> discord.Embed:
             inline=False
         )
     
-    embed.set_footer(text="Updates daily")
+    embed.set_footer(text="ColiBot • Updates daily")
     return embed
 
 
@@ -240,6 +243,12 @@ async def on_ready():
     logger.info(f'Popular posts scheduled for: {POPULAR_POST_TIME}')
     logger.info(f'Newest posts scheduled for: {NEWEST_POST_TIME}')
     logger.info(f'Monitoring forums: {FORUM_URLS}')
+    
+    # Sync slash commands to the guild
+    guild = discord.Object(id=GUILD_ID)
+    tree.copy_global_to(guild=guild)
+    await tree.sync(guild=guild)
+    logger.info(f'Slash commands synced to guild {GUILD_ID}')
     
     if not scheduled_posts.is_running():
         scheduled_posts.start()
@@ -290,51 +299,74 @@ async def scheduled_posts():
                 logger.error(f"Error posting newest threads for {forum_url}: {e}")
 
 
-@bot.command(name='test_popular')
-@commands.has_permissions(administrator=True)
-async def test_popular(ctx):
-    """Test command to check popular threads"""
-    await ctx.send("Fetching popular threads...")
+@tree.command(
+    name="force_trending",
+    description="Manually post the top 5 popular threads right now",
+    guild=discord.Object(id=GUILD_ID)
+)
+async def force_trending(interaction: discord.Interaction):
+    """Force post popular threads"""
+    await interaction.response.defer()
     
     for forum_url in FORUM_URLS:
-        scraper = ForumScraper(forum_url)
-        threads = await scraper.get_popular_threads(5)
-        await scraper.close_session()
-        
-        forum_name = forum_url.split('/')[-2].replace('-', ' ').title()
-        embed = create_popular_embed(threads, forum_name)
-        await ctx.send(embed=embed)
+        try:
+            scraper = ForumScraper(forum_url)
+            threads = await scraper.get_popular_threads(5)
+            await scraper.close_session()
+            
+            forum_name = forum_url.split('/')[-2].replace('-', ' ').title()
+            embed = create_popular_embed(threads, forum_name)
+            await interaction.followup.send(embed=embed)
+            
+            await asyncio.sleep(2)
+        except Exception as e:
+            logger.error(f"Error in force_trending for {forum_url}: {e}")
+            await interaction.followup.send(f"❌ Error fetching threads: {str(e)}")
 
 
-@bot.command(name='test_newest')
-@commands.has_permissions(administrator=True)
-async def test_newest(ctx):
-    """Test command to check newest threads"""
-    await ctx.send("Fetching newest threads...")
+@tree.command(
+    name="force_new",
+    description="Manually post the 5 newest threads right now",
+    guild=discord.Object(id=GUILD_ID)
+)
+async def force_new(interaction: discord.Interaction):
+    """Force post newest threads"""
+    await interaction.response.defer()
     
     for forum_url in FORUM_URLS:
-        scraper = ForumScraper(forum_url)
-        threads = await scraper.get_newest_threads(5)
-        await scraper.close_session()
-        
-        forum_name = forum_url.split('/')[-2].replace('-', ' ').title()
-        embed = create_newest_embed(threads, forum_name)
-        await ctx.send(embed=embed)
+        try:
+            scraper = ForumScraper(forum_url)
+            threads = await scraper.get_newest_threads(5)
+            await scraper.close_session()
+            
+            forum_name = forum_url.split('/')[-2].replace('-', ' ').title()
+            embed = create_newest_embed(threads, forum_name)
+            await interaction.followup.send(embed=embed)
+            
+            await asyncio.sleep(2)
+        except Exception as e:
+            logger.error(f"Error in force_new for {forum_url}: {e}")
+            await interaction.followup.send(f"❌ Error fetching threads: {str(e)}")
 
 
-@bot.command(name='status')
-@commands.has_permissions(administrator=True)
-async def status(ctx):
+@tree.command(
+    name="status",
+    description="Check ColiBot's configuration and status",
+    guild=discord.Object(id=GUILD_ID)
+)
+async def status(interaction: discord.Interaction):
     """Check bot status and configuration"""
     embed = discord.Embed(
-        title="Bot Status",
-        color=discord.Color.blue()
+        title="ColiBot Status",
+        color=discord.Color.blue(),
+        timestamp=datetime.utcnow()
     )
     embed.add_field(name="Popular Posts Time", value=POPULAR_POST_TIME, inline=False)
     embed.add_field(name="Newest Posts Time", value=NEWEST_POST_TIME, inline=False)
     embed.add_field(name="Monitored Forums", value='\n'.join(FORUM_URLS), inline=False)
     embed.add_field(name="Target Channel", value=f"<#{CHANNEL_ID}>", inline=False)
-    await ctx.send(embed=embed)
+    embed.set_footer(text="ColiBot")
+    await interaction.response.send_message(embed=embed)
 
 
 if __name__ == "__main__":
@@ -343,6 +375,9 @@ if __name__ == "__main__":
         exit(1)
     if not CHANNEL_ID:
         logger.error("CHANNEL_ID environment variable not set!")
+        exit(1)
+    if not GUILD_ID:
+        logger.error("GUILD_ID environment variable not set!")
         exit(1)
     
     bot.run(DISCORD_TOKEN)

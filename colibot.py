@@ -52,7 +52,7 @@ async def init_db():
         async with db_pool.acquire() as conn:
             # Create threads table
             await conn.execute('''
-                CREATE TABLE IF NOT EXISTS threads (
+                CREATE TABLE IF NOT EXISTS colibot_threads (
                     id SERIAL PRIMARY KEY,
                     thread_id VARCHAR(50) UNIQUE NOT NULL,
                     title TEXT NOT NULL,
@@ -65,9 +65,9 @@ async def init_db():
             
             # Create snapshots table
             await conn.execute('''
-                CREATE TABLE IF NOT EXISTS thread_snapshots (
+                CREATE TABLE IF NOT EXISTS colibot_thread_snapshots (
                     id SERIAL PRIMARY KEY,
-                    thread_id VARCHAR(50) REFERENCES threads(thread_id),
+                    thread_id VARCHAR(50) REFERENCES colibot_threads(thread_id),
                     replies INTEGER,
                     views INTEGER,
                     captured_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
@@ -76,8 +76,8 @@ async def init_db():
             
             # Create index for faster querying
             await conn.execute('''
-                CREATE INDEX IF NOT EXISTS idx_snapshots_thread_time 
-                ON thread_snapshots(thread_id, captured_at)
+                CREATE INDEX IF NOT EXISTS idx_colibot_snapshots_thread_time 
+                ON colibot_thread_snapshots(thread_id, captured_at)
             ''')
             
         logger.info("Database schema initialized")
@@ -332,7 +332,7 @@ async def save_thread_snapshot(thread_data: Dict):
         async with db_pool.acquire() as conn:
             # Upsert thread info
             await conn.execute('''
-                INSERT INTO threads (thread_id, title, url, author, created_at)
+                INSERT INTO colibot_threads (thread_id, title, url, author, created_at)
                 VALUES ($1, $2, $3, $4, $5)
                 ON CONFLICT (thread_id) DO UPDATE 
                 SET title = $2, url = $3, updated_at = CURRENT_TIMESTAMP
@@ -341,7 +341,7 @@ async def save_thread_snapshot(thread_data: Dict):
             
             # Insert snapshot
             await conn.execute('''
-                INSERT INTO thread_snapshots (thread_id, replies, views)
+                INSERT INTO colibot_thread_snapshots (thread_id, replies, views)
                 VALUES ($1, $2, $3)
             ''', thread_data['id'], thread_data['replies'], thread_data['views'])
             
@@ -361,12 +361,12 @@ async def get_trending_from_db(limit: int = 5, hours: int = 6) -> List[Dict]:
             rows = await conn.fetch('''
                 WITH latest_snapshots AS (
                     SELECT DISTINCT ON (thread_id) thread_id, replies, views, captured_at
-                    FROM thread_snapshots
+                    FROM colibot_thread_snapshots
                     ORDER BY thread_id, captured_at DESC
                 ),
                 past_snapshots AS (
                     SELECT DISTINCT ON (thread_id) thread_id, replies, views, captured_at
-                    FROM thread_snapshots
+                    FROM colibot_thread_snapshots
                     WHERE captured_at <= NOW() - interval '1 hour' * $1
                     ORDER BY thread_id, captured_at DESC
                 )
@@ -378,7 +378,7 @@ async def get_trending_from_db(limit: int = 5, hours: int = 6) -> List[Dict]:
                     (l.views - COALESCE(p.views, 0)) as view_growth
                 FROM latest_snapshots l
                 LEFT JOIN past_snapshots p ON l.thread_id = p.thread_id
-                JOIN threads t ON l.thread_id = t.thread_id
+                JOIN colibot_threads t ON l.thread_id = t.thread_id
                 WHERE l.captured_at > NOW() - interval '1 hour'
                 ORDER BY reply_growth DESC, view_growth DESC
                 LIMIT $2

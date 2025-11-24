@@ -344,6 +344,18 @@ async def save_thread_snapshot(thread_data: Dict):
 
     try:
         async with db_pool.acquire() as conn:
+            # Check if the latest snapshot is identical to current data
+            latest = await conn.fetchrow('''
+                SELECT replies, views FROM colibot_thread_snapshots 
+                WHERE thread_id = $1 
+                ORDER BY captured_at DESC 
+                LIMIT 1
+            ''', thread_data['id'])
+            
+            if latest and latest['replies'] == thread_data['replies'] and latest['views'] == thread_data['views']:
+                logger.debug(f"Skipping snapshot for thread {thread_data['id']} (no change)")
+                return
+
             # Upsert thread info
             await conn.execute('''
                 INSERT INTO colibot_threads (thread_id, title, url, author, created_at)
@@ -427,16 +439,16 @@ async def get_trending_from_db(limit: int = 5, hours: int = 6) -> List[Dict]:
         return []
 
 
-@tasks.loop(minutes=30)
+@tasks.loop(minutes=60)
 async def scheduled_scraper():
     """Background task to scrape threads and save snapshots"""
     logger.info("Starting scheduled scrape for snapshots...")
     for forum_url in FORUM_URLS:
         try:
             scraper = ForumScraper(forum_url)
-            # Fetch newest threads to capture activity
-            # We fetch a larger number to ensure we catch active threads
-            threads = await scraper.get_newest_threads(limit=40, hours=24)
+            # Fetch trending (active) threads to capture activity
+            # We fetch a larger number to ensure we catch active threads from the last 24h
+            threads = await scraper.get_trending_threads(limit=40, hours=24)
             await scraper.close_session()
             
             count = 0

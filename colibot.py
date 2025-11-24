@@ -165,8 +165,10 @@ class ForumScraper:
         threads = []
         cutoff_time = datetime.now(datetime.now().astimezone().tzinfo) - timedelta(hours=hours)
         
-        # Get all thread elements
-        thread_elements = soup.find_all('div', class_='structItem--thread', limit=limit * 3)
+        # Get all thread elements - get more to account for filtering
+        thread_elements = soup.find_all('div', class_='structItem--thread', limit=limit * 5)
+        
+        logger.info(f"Found {len(thread_elements)} thread elements for trending")
         
         for element in thread_elements:
             thread_data = self.parse_thread_element(element, base_url)
@@ -180,9 +182,15 @@ class ForumScraper:
                     
                     if thread_data['created_at'] >= cutoff_time:
                         threads.append(thread_data)
+                        logger.debug(f"Added trending thread: {thread_data['title'][:50]}")
+                    else:
+                        logger.debug(f"Thread too old: {thread_data['title'][:50]}")
                 else:
                     # If no timestamp, include it (might be recent)
                     threads.append(thread_data)
+                    logger.debug(f"Added thread without timestamp: {thread_data['title'][:50]}")
+        
+        logger.info(f"After filtering: {len(threads)} trending threads")
         
         # Sort by popularity score
         threads.sort(key=lambda x: x['score'], reverse=True)
@@ -204,7 +212,9 @@ class ForumScraper:
         cutoff_time = datetime.now(datetime.now().astimezone().tzinfo) - timedelta(hours=hours)
         
         # Get thread elements
-        thread_elements = soup.find_all('div', class_='structItem--thread', limit=limit * 2)
+        thread_elements = soup.find_all('div', class_='structItem--thread', limit=limit * 3)
+        
+        logger.info(f"Found {len(thread_elements)} thread elements for newest")
         
         for element in thread_elements:
             thread_data = self.parse_thread_element(element, base_url)
@@ -218,12 +228,18 @@ class ForumScraper:
                     
                     if thread_data['created_at'] >= cutoff_time:
                         threads.append(thread_data)
+                        logger.debug(f"Added new thread: {thread_data['title'][:50]}")
+                    else:
+                        logger.debug(f"Thread too old: {thread_data['title'][:50]}")
                 else:
                     # If no timestamp parseable, include anyway
                     threads.append(thread_data)
+                    logger.debug(f"Added thread without timestamp: {thread_data['title'][:50]}")
                 
                 if len(threads) >= limit:
                     break
+        
+        logger.info(f"After filtering: {len(threads)} newest threads")
         
         return threads[:limit]
 
@@ -231,10 +247,14 @@ class ForumScraper:
 def create_trending_embed(threads: List[Dict], forum_name: str, hours: int) -> discord.Embed:
     """Create Discord embed for trending threads"""
     embed = discord.Embed(
-        title=f"🔥 Top 5 Trending Threads (Last {hours}h) - {forum_name}",
-        color=discord.Color.orange(),
+        title="🔥 Trending Threads",
+        description=f"*Most popular discussions from the last {hours} hours*",
+        color=0xFF6B35,  # Vibrant orange-red
         timestamp=datetime.utcnow()
     )
+    
+    # Add The Coli logo as thumbnail
+    embed.set_thumbnail(url="https://www.thecoli.com/styles/default/xenforo/logo.png")
     
     if not threads:
         embed.description = f"No threads found in the last {hours} hours."
@@ -245,23 +265,30 @@ def create_trending_embed(threads: List[Dict], forum_name: str, hours: int) -> d
         views = thread.get('views', 0)
         author = thread.get('author', 'Unknown')
         
+        # Create more visually appealing field value
+        stats = f"💬 **{replies:,}** replies  •  👁️ **{views:,}** views"
+        
         embed.add_field(
-            name=f"{i}. {thread['title'][:100]}",
-            value=f"👤 {author} | 💬 {replies:,} replies | 👁️ {views:,} views\n[View Thread]({thread['url']})",
+            name=f"**{i}.** {thread['title'][:100]}",
+            value=f"by {author}\n{stats}\n[→ View Thread]({thread['url']})",
             inline=False
         )
     
-    embed.set_footer(text="ColiBot • Updates daily")
+    embed.set_footer(text="The Coli • Updates daily", icon_url="https://www.thecoli.com/styles/default/xenforo/logo.png")
     return embed
 
 
 def create_newest_embed(threads: List[Dict], forum_name: str, hours: int) -> discord.Embed:
     """Create Discord embed for newest threads"""
     embed = discord.Embed(
-        title=f"🆕 Latest 5 Threads (Last {hours}h) - {forum_name}",
-        color=discord.Color.green(),
+        title="🆕 Newest Threads",
+        description=f"*Fresh discussions from the last {hours} hours*",
+        color=0x00D9FF,  # Bright cyan
         timestamp=datetime.utcnow()
     )
+    
+    # Add The Coli logo as thumbnail
+    embed.set_thumbnail(url="https://www.thecoli.com/styles/default/xenforo/logo.png")
     
     if not threads:
         embed.description = f"No new threads in the last {hours} hours."
@@ -272,12 +299,12 @@ def create_newest_embed(threads: List[Dict], forum_name: str, hours: int) -> dis
         timestamp = thread.get('timestamp_display', 'Recently')
         
         embed.add_field(
-            name=f"{i}. {thread['title'][:100]}",
-            value=f"👤 {author} | 🕐 {timestamp}\n[View Thread]({thread['url']})",
+            name=f"**{i}.** {thread['title'][:100]}",
+            value=f"by {author}  •  🕐 {timestamp}\n[→ View Thread]({thread['url']})",
             inline=False
         )
     
-    embed.set_footer(text="ColiBot • Updates daily")
+    embed.set_footer(text="The Coli • Updates daily", icon_url="https://www.thecoli.com/styles/default/xenforo/logo.png")
     return embed
 
 

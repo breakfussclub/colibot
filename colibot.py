@@ -152,8 +152,9 @@ class ForumScraper:
     
     async def get_trending_threads(self, limit: int = 5, hours: int = 6) -> List[Dict]:
         """Fetch trending threads from the last N hours, sorted by popularity"""
-        # XenForo URL parameters: order by replies, recent first
-        url = f"{self.forum_url}?order=reply_count&direction=desc"
+        # CHANGED: Use order=post_date to get RECENT threads, then sort by score.
+        # Old logic used order=reply_count which returned old threads that were then filtered out.
+        url = f"{self.forum_url}?order=post_date&direction=desc"
         html = await self.fetch_page(url)
         
         if not html:
@@ -166,7 +167,8 @@ class ForumScraper:
         cutoff_time = datetime.now(datetime.now().astimezone().tzinfo) - timedelta(hours=hours)
         
         # Get all thread elements - get more to account for filtering
-        thread_elements = soup.find_all('div', class_='structItem--thread', limit=limit * 5)
+        # Fetch up to 50 threads (approx 2 pages worth if on one page) to find the best ones
+        thread_elements = soup.find_all('div', class_='structItem--thread', limit=50)
         
         logger.info(f"Found {len(thread_elements)} thread elements for trending")
         
@@ -182,15 +184,17 @@ class ForumScraper:
                     
                     if thread_data['created_at'] >= cutoff_time:
                         threads.append(thread_data)
-                        logger.debug(f"Added trending thread: {thread_data['title'][:50]}")
+                        logger.debug(f"Added trending thread candidate: {thread_data['title'][:50]}")
                     else:
+                        # Since we are ordered by date, we could technically break here,
+                        # but we'll continue just to be safe against sticky threads or anomalies
                         logger.debug(f"Thread too old: {thread_data['title'][:50]}")
                 else:
                     # If no timestamp, include it (might be recent)
                     threads.append(thread_data)
                     logger.debug(f"Added thread without timestamp: {thread_data['title'][:50]}")
         
-        logger.info(f"After filtering: {len(threads)} trending threads")
+        logger.info(f"After filtering: {len(threads)} trending threads in time window")
         
         # Sort by popularity score
         threads.sort(key=lambda x: x['score'], reverse=True)

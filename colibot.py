@@ -134,7 +134,19 @@ class ForumScraper:
                     timestamp_display = title_attr
                 else:
                     timestamp_display = time_elem.get_text(strip=True)
+
+            # Extract timestamp for last post date
+            last_post_elem = element.find('time', class_='structItem-latestDate')
+            last_post_timestamp = None
             
+            if last_post_elem:
+                datetime_str = last_post_elem.get('datetime')
+                if datetime_str:
+                    try:
+                        last_post_timestamp = datetime.fromisoformat(datetime_str.replace('Z', '+00:00'))
+                    except:
+                        pass
+
             return {
                 'title': title,
                 'url': thread_url,
@@ -142,6 +154,7 @@ class ForumScraper:
                 'replies': replies,
                 'views': views,
                 'created_at': created_timestamp,
+                'last_post_at': last_post_timestamp,
                 'timestamp_display': timestamp_display,
                 'score': replies + (views / 10)  # Popularity score
             }
@@ -151,10 +164,9 @@ class ForumScraper:
             return None
     
     async def get_trending_threads(self, limit: int = 5, hours: int = 6) -> List[Dict]:
-        """Fetch trending threads from the last N hours, sorted by popularity"""
-        # CHANGED: Use order=post_date to get RECENT threads, then sort by score.
-        # Old logic used order=reply_count which returned old threads that were then filtered out.
-        url = f"{self.forum_url}?order=post_date&direction=desc"
+        """Fetch trending threads (active in last N hours), sorted by popularity"""
+        # Use order=last_post_date to get threads with recent activity
+        url = f"{self.forum_url}?order=last_post_date&direction=desc"
         html = await self.fetch_page(url)
         
         if not html:
@@ -167,7 +179,7 @@ class ForumScraper:
         cutoff_time = datetime.now(datetime.now().astimezone().tzinfo) - timedelta(hours=hours)
         
         # Get all thread elements - get more to account for filtering
-        # Fetch up to 50 threads (approx 2 pages worth if on one page) to find the best ones
+        # Fetch up to 50 threads to find the best ones
         thread_elements = soup.find_all('div', class_='structItem--thread', limit=50)
         
         logger.info(f"Found {len(thread_elements)} thread elements for trending")
@@ -176,19 +188,19 @@ class ForumScraper:
             thread_data = self.parse_thread_element(element, base_url)
             
             if thread_data:
-                # Filter by time if we have a timestamp
-                if thread_data['created_at']:
+                # Filter by last post time if we have a timestamp
+                if thread_data.get('last_post_at'):
                     # Make cutoff_time timezone-aware if thread timestamp is
-                    if thread_data['created_at'].tzinfo is not None and cutoff_time.tzinfo is None:
-                        cutoff_time = cutoff_time.replace(tzinfo=thread_data['created_at'].tzinfo)
+                    if thread_data['last_post_at'].tzinfo is not None and cutoff_time.tzinfo is None:
+                        cutoff_time = cutoff_time.replace(tzinfo=thread_data['last_post_at'].tzinfo)
                     
-                    if thread_data['created_at'] >= cutoff_time:
+                    if thread_data['last_post_at'] >= cutoff_time:
                         threads.append(thread_data)
                         logger.debug(f"Added trending thread candidate: {thread_data['title'][:50]}")
                     else:
-                        # Since we are ordered by date, we could technically break here,
-                        # but we'll continue just to be safe against sticky threads or anomalies
-                        logger.debug(f"Thread too old: {thread_data['title'][:50]}")
+                        # Since we are ordered by last post date, we can stop here
+                        logger.debug(f"Thread too old (last post): {thread_data['title'][:50]}")
+                        # break  # Uncommenting break for efficiency since we are sorted by last post
                 else:
                     # If no timestamp, include it (might be recent)
                     threads.append(thread_data)

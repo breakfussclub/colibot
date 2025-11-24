@@ -1,0 +1,5 @@
+discord.py
+feedparser
+apscheduler
+beautifulsoup4
+aiohttp

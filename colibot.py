@@ -6,9 +6,10 @@ from bs4 import BeautifulSoup
 import os
 from datetime import datetime, timedelta
 import asyncio
-from typing import List, Dict
+from typing import List, Dict, Optional
 import logging
 import re
+import asyncpg
 
 # Configure logging
 logging.basicConfig(
@@ -21,16 +22,69 @@ logger = logging.getLogger('ColiBot')
 DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
 CHANNEL_ID = int(os.getenv('CHANNEL_ID'))
 GUILD_ID = int(os.getenv('GUILD_ID'))
+DATABASE_URL = os.getenv('DATABASE_URL')
 POPULAR_POST_TIME = os.getenv('POPULAR_POST_TIME', '09:00')
 NEWEST_POST_TIME = os.getenv('NEWEST_POST_TIME', '18:00')
 FORUM_URLS = os.getenv('FORUM_URLS', 'https://www.thecoli.com/forums/the-locker-room.6/').split(',')
 TIME_FILTER_HOURS = int(os.getenv('TIME_FILTER_HOURS', '6'))  # Default 6 hours
+
+# Global DB Pool
+db_pool: Optional[asyncpg.Pool] = None
 
 # Bot setup
 intents = discord.Intents.default()
 intents.message_content = True
 bot = discord.Client(intents=intents)
 tree = app_commands.CommandTree(bot)
+
+
+async def init_db():
+    """Initialize database connection and schema"""
+    global db_pool
+    if not DATABASE_URL:
+        logger.error("DATABASE_URL not set!")
+        return
+
+    try:
+        db_pool = await asyncpg.create_pool(DATABASE_URL)
+        logger.info("Connected to database")
+        
+        async with db_pool.acquire() as conn:
+            # Create threads table
+            await conn.execute('''
+                CREATE TABLE IF NOT EXISTS threads (
+                    id SERIAL PRIMARY KEY,
+                    thread_id VARCHAR(50) UNIQUE NOT NULL,
+                    title TEXT NOT NULL,
+                    url TEXT NOT NULL,
+                    author TEXT,
+                    created_at TIMESTAMP WITH TIME ZONE,
+                    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            
+            # Create snapshots table
+            await conn.execute('''
+                CREATE TABLE IF NOT EXISTS thread_snapshots (
+                    id SERIAL PRIMARY KEY,
+                    thread_id VARCHAR(50) REFERENCES threads(thread_id),
+                    replies INTEGER,
+                    views INTEGER,
+                    captured_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            
+            # Create index for faster querying
+            await conn.execute('''
+                CREATE INDEX IF NOT EXISTS idx_snapshots_thread_time 
+                ON thread_snapshots(thread_id, captured_at)
+            ''')
+            
+        logger.info("Database schema initialized")
+            
+    except Exception as e:
+        logger.error(f"Failed to initialize database: {e}")
+
 
 
 class ForumScraper:
@@ -78,6 +132,13 @@ class ForumScraper:
             thread_url = title_elem.get('href', '')
             if thread_url and not thread_url.startswith('http'):
                 thread_url = base_url + thread_url
+            
+            # Extract thread ID
+            thread_id = None
+            # URL format: .../thread-title.12345/
+            match = re.search(r'\.(\d+)/?$', thread_url.split('/unread')[0])
+            if match:
+                thread_id = match.group(1)
             
             # Extract author
             author = "Unknown"
@@ -148,6 +209,7 @@ class ForumScraper:
                         pass
 
             return {
+                'id': thread_id,
                 'title': title,
                 'url': thread_url,
                 'author': author,
@@ -260,6 +322,112 @@ class ForumScraper:
         return threads[:limit]
 
 
+
+async def save_thread_snapshot(thread_data: Dict):
+    """Save thread data and snapshot to database"""
+    if not db_pool or not thread_data.get('id'):
+        return
+
+    try:
+        async with db_pool.acquire() as conn:
+            # Upsert thread info
+            await conn.execute('''
+                INSERT INTO threads (thread_id, title, url, author, created_at)
+                VALUES ($1, $2, $3, $4, $5)
+                ON CONFLICT (thread_id) DO UPDATE 
+                SET title = $2, url = $3, updated_at = CURRENT_TIMESTAMP
+            ''', thread_data['id'], thread_data['title'], thread_data['url'], 
+                 thread_data['author'], thread_data['created_at'])
+            
+            # Insert snapshot
+            await conn.execute('''
+                INSERT INTO thread_snapshots (thread_id, replies, views)
+                VALUES ($1, $2, $3)
+            ''', thread_data['id'], thread_data['replies'], thread_data['views'])
+            
+    except Exception as e:
+        logger.error(f"Error saving snapshot for thread {thread_data.get('id')}: {e}")
+
+
+async def get_trending_from_db(limit: int = 5, hours: int = 6) -> List[Dict]:
+    """Get trending threads based on velocity (growth) from DB"""
+    if not db_pool:
+        return []
+
+    try:
+        async with db_pool.acquire() as conn:
+            # Calculate growth: (current_replies - past_replies)
+            # We look for the latest snapshot and compare it with one from ~hours ago
+            rows = await conn.fetch('''
+                WITH latest_snapshots AS (
+                    SELECT DISTINCT ON (thread_id) thread_id, replies, views, captured_at
+                    FROM thread_snapshots
+                    ORDER BY thread_id, captured_at DESC
+                ),
+                past_snapshots AS (
+                    SELECT DISTINCT ON (thread_id) thread_id, replies, views, captured_at
+                    FROM thread_snapshots
+                    WHERE captured_at <= NOW() - interval '1 hour' * $1
+                    ORDER BY thread_id, captured_at DESC
+                )
+                SELECT 
+                    t.title, t.url, t.author,
+                    l.replies as current_replies,
+                    l.views as current_views,
+                    (l.replies - COALESCE(p.replies, 0)) as reply_growth,
+                    (l.views - COALESCE(p.views, 0)) as view_growth
+                FROM latest_snapshots l
+                LEFT JOIN past_snapshots p ON l.thread_id = p.thread_id
+                JOIN threads t ON l.thread_id = t.thread_id
+                WHERE l.captured_at > NOW() - interval '1 hour'
+                ORDER BY reply_growth DESC, view_growth DESC
+                LIMIT $2
+            ''', float(hours), limit)
+            
+            results = []
+            for row in rows:
+                results.append({
+                    'title': row['title'],
+                    'url': row['url'],
+                    'author': row['author'],
+                    'replies': row['current_replies'],
+                    'views': row['current_views'],
+                    'score': row['reply_growth'] + (row['view_growth'] / 100), # Velocity score
+                    'growth_display': f"📈 +{row['reply_growth']} replies in last {hours}h"
+                })
+            
+            return results
+            
+    except Exception as e:
+        logger.error(f"Error fetching trending from DB: {e}")
+        return []
+
+
+@tasks.loop(minutes=30)
+async def scheduled_scraper():
+    """Background task to scrape threads and save snapshots"""
+    logger.info("Starting scheduled scrape for snapshots...")
+    for forum_url in FORUM_URLS:
+        try:
+            scraper = ForumScraper(forum_url)
+            # Fetch newest threads to capture activity
+            # We fetch a larger number to ensure we catch active threads
+            threads = await scraper.get_newest_threads(limit=40, hours=24)
+            await scraper.close_session()
+            
+            count = 0
+            for thread in threads:
+                if thread.get('id'):
+                    await save_thread_snapshot(thread)
+                    count += 1
+            
+            logger.info(f"Saved snapshots for {count} threads from {forum_url}")
+            await asyncio.sleep(5) # Be nice to the server
+            
+        except Exception as e:
+            logger.error(f"Error in scheduled_scraper for {forum_url}: {e}")
+
+
 def create_trending_embed(threads: List[Dict], forum_name: str, hours: int) -> discord.Embed:
     """Create Discord embed for trending threads"""
     embed = discord.Embed(
@@ -282,7 +450,10 @@ def create_trending_embed(threads: List[Dict], forum_name: str, hours: int) -> d
         author = thread.get('author', 'Unknown')
         
         # Create more visually appealing field value
-        stats = f"💬 **{replies:,}** replies  •  👁️ **{views:,}** views"
+        if thread.get('growth_display'):
+            stats = f"{thread['growth_display']}  •  💬 {replies:,} total  •  👁️ {views:,} views"
+        else:
+            stats = f"💬 **{replies:,}** replies  •  👁️ **{views:,}** views"
         
         embed.add_field(
             name=f"**{i}.** {thread['title'][:100]}",
@@ -340,6 +511,11 @@ async def on_ready():
     
     if not scheduled_posts.is_running():
         scheduled_posts.start()
+    
+    # Initialize DB and start scraper
+    await init_db()
+    if not scheduled_scraper.is_running():
+        scheduled_scraper.start()
 
 
 @tasks.loop(minutes=1)
@@ -357,9 +533,15 @@ async def scheduled_posts():
         logger.info("Posting trending threads...")
         for forum_url in FORUM_URLS:
             try:
-                scraper = ForumScraper(forum_url)
-                threads = await scraper.get_trending_threads(5, TIME_FILTER_HOURS)
-                await scraper.close_session()
+                # Try to get from DB first
+                threads = await get_trending_from_db(5, TIME_FILTER_HOURS)
+                
+                # Fallback if DB returns nothing (e.g. first run)
+                if not threads:
+                    logger.info("No DB stats yet, falling back to scraper")
+                    scraper = ForumScraper(forum_url)
+                    threads = await scraper.get_trending_threads(5, TIME_FILTER_HOURS)
+                    await scraper.close_session()
                 
                 forum_name = forum_url.split('/')[-2].replace('-', ' ').title()
                 embed = create_trending_embed(threads, forum_name, TIME_FILTER_HOURS)
@@ -398,9 +580,14 @@ async def force_trending(interaction: discord.Interaction):
     
     for forum_url in FORUM_URLS:
         try:
-            scraper = ForumScraper(forum_url)
-            threads = await scraper.get_trending_threads(5, TIME_FILTER_HOURS)
-            await scraper.close_session()
+            # Try to get from DB first
+            threads = await get_trending_from_db(5, TIME_FILTER_HOURS)
+            
+            # Fallback
+            if not threads:
+                scraper = ForumScraper(forum_url)
+                threads = await scraper.get_trending_threads(5, TIME_FILTER_HOURS)
+                await scraper.close_session()
             
             forum_name = forum_url.split('/')[-2].replace('-', ' ').title()
             embed = create_trending_embed(threads, forum_name, TIME_FILTER_HOURS)

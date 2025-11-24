@@ -4,10 +4,11 @@ from discord.ext import tasks
 import aiohttp
 from bs4 import BeautifulSoup
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 import asyncio
 from typing import List, Dict
 import logging
+import re
 
 # Configure logging
 logging.basicConfig(
@@ -19,10 +20,11 @@ logger = logging.getLogger('ColiBot')
 # Environment variables
 DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
 CHANNEL_ID = int(os.getenv('CHANNEL_ID'))
-GUILD_ID = int(os.getenv('GUILD_ID'))  # Guild ID for slash command registration
-POPULAR_POST_TIME = os.getenv('POPULAR_POST_TIME', '09:00')  # Format: HH:MM
-NEWEST_POST_TIME = os.getenv('NEWEST_POST_TIME', '18:00')    # Format: HH:MM
+GUILD_ID = int(os.getenv('GUILD_ID'))
+POPULAR_POST_TIME = os.getenv('POPULAR_POST_TIME', '09:00')
+NEWEST_POST_TIME = os.getenv('NEWEST_POST_TIME', '18:00')
 FORUM_URLS = os.getenv('FORUM_URLS', 'https://www.thecoli.com/forums/the-locker-room.6/').split(',')
+TIME_FILTER_HOURS = int(os.getenv('TIME_FILTER_HOURS', '6'))  # Default 6 hours
 
 # Bot setup
 intents = discord.Intents.default()
@@ -61,139 +63,181 @@ class ForumScraper:
             logger.error(f"Error fetching {url}: {e}")
             return None
     
-    async def get_popular_threads(self, limit: int = 5) -> List[Dict]:
-        """Fetch most popular threads (sorted by replies/views)"""
-        html = await self.fetch_page(self.forum_url)
+    def parse_thread_element(self, element, base_url: str) -> Dict:
+        """Parse a single thread element and extract all data"""
+        try:
+            # Extract thread title and URL
+            title_elem = element.find('a', {'data-tp-primary': 'on'})
+            if not title_elem:
+                title_elem = element.find('a', class_='structItem-title')
+            
+            if not title_elem:
+                return None
+            
+            title = title_elem.get_text(strip=True)
+            thread_url = title_elem.get('href', '')
+            if thread_url and not thread_url.startswith('http'):
+                thread_url = base_url + thread_url
+            
+            # Extract author
+            author = "Unknown"
+            author_elem = element.find('a', class_='username')
+            if author_elem:
+                author = author_elem.get_text(strip=True)
+            
+            # Extract replies and views from the meta section
+            replies = 0
+            views = 0
+            
+            # Look for the stats in structItem-cell--meta
+            meta_cell = element.find('div', class_='structItem-cell--meta')
+            if meta_cell:
+                # Find all dd elements which contain the numbers
+                dds = meta_cell.find_all('dd')
+                if len(dds) >= 2:
+                    try:
+                        # First dd is usually replies, second is views
+                        replies_text = dds[0].get_text(strip=True).replace(',', '')
+                        views_text = dds[1].get_text(strip=True).replace(',', '')
+                        
+                        # Extract just the numbers
+                        replies_match = re.search(r'(\d+)', replies_text)
+                        views_match = re.search(r'(\d+)', views_text)
+                        
+                        if replies_match:
+                            replies = int(replies_match.group(1))
+                        if views_match:
+                            views = int(views_match.group(1))
+                    except (ValueError, AttributeError) as e:
+                        logger.debug(f"Could not parse stats: {e}")
+            
+            # Extract timestamp for creation date
+            time_elem = element.find('time', class_='structItem-startDate')
+            if not time_elem:
+                time_elem = element.find('time')
+            
+            created_timestamp = None
+            timestamp_display = "Recently"
+            
+            if time_elem:
+                # Try to get the datetime attribute
+                datetime_str = time_elem.get('datetime')
+                if datetime_str:
+                    try:
+                        created_timestamp = datetime.fromisoformat(datetime_str.replace('Z', '+00:00'))
+                    except:
+                        pass
+                
+                # Get display text
+                title_attr = time_elem.get('title')
+                if title_attr:
+                    timestamp_display = title_attr
+                else:
+                    timestamp_display = time_elem.get_text(strip=True)
+            
+            return {
+                'title': title,
+                'url': thread_url,
+                'author': author,
+                'replies': replies,
+                'views': views,
+                'created_at': created_timestamp,
+                'timestamp_display': timestamp_display,
+                'score': replies + (views / 10)  # Popularity score
+            }
+        
+        except Exception as e:
+            logger.error(f"Error parsing thread element: {e}")
+            return None
+    
+    async def get_trending_threads(self, limit: int = 5, hours: int = 6) -> List[Dict]:
+        """Fetch trending threads from the last N hours, sorted by popularity"""
+        # XenForo URL parameters: order by replies, recent first
+        url = f"{self.forum_url}?order=reply_count&direction=desc"
+        html = await self.fetch_page(url)
+        
         if not html:
             return []
         
         soup = BeautifulSoup(html, 'html.parser')
-        threads = []
+        base_url = self.forum_url.split('/forums/')[0]
         
-        # XenForo thread structure
-        thread_elements = soup.find_all('div', class_='structItem--thread', limit=limit * 2)
+        threads = []
+        cutoff_time = datetime.now(datetime.now().astimezone().tzinfo) - timedelta(hours=hours)
+        
+        # Get all thread elements
+        thread_elements = soup.find_all('div', class_='structItem--thread', limit=limit * 3)
         
         for element in thread_elements:
-            try:
-                # Extract thread title and URL
-                title_elem = element.find('a', {'data-tp-primary': 'on'})
-                if not title_elem:
-                    title_elem = element.find('a', class_='structItem-title')
-                
-                if not title_elem:
-                    continue
-                
-                title = title_elem.get_text(strip=True)
-                thread_url = title_elem.get('href', '')
-                if thread_url and not thread_url.startswith('http'):
-                    base_url = self.forum_url.split('/forums/')[0]
-                    thread_url = base_url + thread_url
-                
-                # Extract replies and views
-                stats = element.find('div', class_='structItem-cell--meta')
-                replies = 0
-                views = 0
-                
-                if stats:
-                    replies_elem = stats.find('dd', text=lambda t: t and 'replies' in t.lower())
-                    if not replies_elem:
-                        replies_elem = stats.find('dl', class_='pairs--justified')
-                        if replies_elem:
-                            dds = replies_elem.find_all('dd')
-                            if len(dds) >= 2:
-                                try:
-                                    replies = int(dds[0].get_text(strip=True).replace(',', ''))
-                                    views = int(dds[1].get_text(strip=True).replace(',', ''))
-                                except:
-                                    pass
-                
-                # Extract author
-                author = "Unknown"
-                author_elem = element.find('a', class_='username')
-                if author_elem:
-                    author = author_elem.get_text(strip=True)
-                
-                threads.append({
-                    'title': title,
-                    'url': thread_url,
-                    'replies': replies,
-                    'views': views,
-                    'author': author,
-                    'score': replies + (views / 10)  # Popularity score
-                })
+            thread_data = self.parse_thread_element(element, base_url)
             
-            except Exception as e:
-                logger.error(f"Error parsing thread: {e}")
-                continue
+            if thread_data:
+                # Filter by time if we have a timestamp
+                if thread_data['created_at']:
+                    # Make cutoff_time timezone-aware if thread timestamp is
+                    if thread_data['created_at'].tzinfo is not None and cutoff_time.tzinfo is None:
+                        cutoff_time = cutoff_time.replace(tzinfo=thread_data['created_at'].tzinfo)
+                    
+                    if thread_data['created_at'] >= cutoff_time:
+                        threads.append(thread_data)
+                else:
+                    # If no timestamp, include it (might be recent)
+                    threads.append(thread_data)
         
         # Sort by popularity score
         threads.sort(key=lambda x: x['score'], reverse=True)
         return threads[:limit]
     
-    async def get_newest_threads(self, limit: int = 5) -> List[Dict]:
-        """Fetch newest threads"""
-        html = await self.fetch_page(self.forum_url)
+    async def get_newest_threads(self, limit: int = 5, hours: int = 6) -> List[Dict]:
+        """Fetch newest threads created in the last N hours"""
+        # XenForo URL parameters: order by creation date
+        url = f"{self.forum_url}?order=post_date&direction=desc"
+        html = await self.fetch_page(url)
+        
         if not html:
             return []
         
         soup = BeautifulSoup(html, 'html.parser')
-        threads = []
+        base_url = self.forum_url.split('/forums/')[0]
         
-        # XenForo thread structure - newest are typically at the top
-        thread_elements = soup.find_all('div', class_='structItem--thread', limit=limit)
+        threads = []
+        cutoff_time = datetime.now(datetime.now().astimezone().tzinfo) - timedelta(hours=hours)
+        
+        # Get thread elements
+        thread_elements = soup.find_all('div', class_='structItem--thread', limit=limit * 2)
         
         for element in thread_elements:
-            try:
-                # Extract thread title and URL
-                title_elem = element.find('a', {'data-tp-primary': 'on'})
-                if not title_elem:
-                    title_elem = element.find('a', class_='structItem-title')
-                
-                if not title_elem:
-                    continue
-                
-                title = title_elem.get_text(strip=True)
-                thread_url = title_elem.get('href', '')
-                if thread_url and not thread_url.startswith('http'):
-                    base_url = self.forum_url.split('/forums/')[0]
-                    thread_url = base_url + thread_url
-                
-                # Extract author
-                author = "Unknown"
-                author_elem = element.find('a', class_='username')
-                if author_elem:
-                    author = author_elem.get_text(strip=True)
-                
-                # Extract timestamp
-                time_elem = element.find('time')
-                timestamp = "Just now"
-                if time_elem:
-                    timestamp = time_elem.get('title', time_elem.get_text(strip=True))
-                
-                threads.append({
-                    'title': title,
-                    'url': thread_url,
-                    'author': author,
-                    'timestamp': timestamp
-                })
+            thread_data = self.parse_thread_element(element, base_url)
             
-            except Exception as e:
-                logger.error(f"Error parsing thread: {e}")
-                continue
+            if thread_data:
+                # Filter by creation time if available
+                if thread_data['created_at']:
+                    # Make cutoff_time timezone-aware if thread timestamp is
+                    if thread_data['created_at'].tzinfo is not None and cutoff_time.tzinfo is None:
+                        cutoff_time = cutoff_time.replace(tzinfo=thread_data['created_at'].tzinfo)
+                    
+                    if thread_data['created_at'] >= cutoff_time:
+                        threads.append(thread_data)
+                else:
+                    # If no timestamp parseable, include anyway
+                    threads.append(thread_data)
+                
+                if len(threads) >= limit:
+                    break
         
         return threads[:limit]
 
 
-def create_popular_embed(threads: List[Dict], forum_name: str) -> discord.Embed:
-    """Create Discord embed for popular threads"""
+def create_trending_embed(threads: List[Dict], forum_name: str, hours: int) -> discord.Embed:
+    """Create Discord embed for trending threads"""
     embed = discord.Embed(
-        title=f"🔥 Top 5 Popular Threads - {forum_name}",
+        title=f"🔥 Top 5 Trending Threads (Last {hours}h) - {forum_name}",
         color=discord.Color.orange(),
         timestamp=datetime.utcnow()
     )
     
     if not threads:
-        embed.description = "No threads found at this time."
+        embed.description = f"No threads found in the last {hours} hours."
         return embed
     
     for i, thread in enumerate(threads, 1):
@@ -211,21 +255,21 @@ def create_popular_embed(threads: List[Dict], forum_name: str) -> discord.Embed:
     return embed
 
 
-def create_newest_embed(threads: List[Dict], forum_name: str) -> discord.Embed:
+def create_newest_embed(threads: List[Dict], forum_name: str, hours: int) -> discord.Embed:
     """Create Discord embed for newest threads"""
     embed = discord.Embed(
-        title=f"🆕 Latest 5 Threads - {forum_name}",
+        title=f"🆕 Latest 5 Threads (Last {hours}h) - {forum_name}",
         color=discord.Color.green(),
         timestamp=datetime.utcnow()
     )
     
     if not threads:
-        embed.description = "No threads found at this time."
+        embed.description = f"No new threads in the last {hours} hours."
         return embed
     
     for i, thread in enumerate(threads, 1):
         author = thread.get('author', 'Unknown')
-        timestamp = thread.get('timestamp', 'Recently')
+        timestamp = thread.get('timestamp_display', 'Recently')
         
         embed.add_field(
             name=f"{i}. {thread['title'][:100]}",
@@ -242,6 +286,7 @@ async def on_ready():
     logger.info(f'{bot.user} has connected to Discord!')
     logger.info(f'Popular posts scheduled for: {POPULAR_POST_TIME}')
     logger.info(f'Newest posts scheduled for: {NEWEST_POST_TIME}')
+    logger.info(f'Time filter: Last {TIME_FILTER_HOURS} hours')
     logger.info(f'Monitoring forums: {FORUM_URLS}')
     
     # Sync slash commands to the guild
@@ -264,22 +309,22 @@ async def scheduled_posts():
         logger.error(f"Channel {CHANNEL_ID} not found")
         return
     
-    # Post popular threads
+    # Post trending threads
     if now == POPULAR_POST_TIME:
-        logger.info("Posting popular threads...")
+        logger.info("Posting trending threads...")
         for forum_url in FORUM_URLS:
             try:
                 scraper = ForumScraper(forum_url)
-                threads = await scraper.get_popular_threads(5)
+                threads = await scraper.get_trending_threads(5, TIME_FILTER_HOURS)
                 await scraper.close_session()
                 
                 forum_name = forum_url.split('/')[-2].replace('-', ' ').title()
-                embed = create_popular_embed(threads, forum_name)
+                embed = create_trending_embed(threads, forum_name, TIME_FILTER_HOURS)
                 await channel.send(embed=embed)
                 
-                await asyncio.sleep(2)  # Rate limit protection
+                await asyncio.sleep(2)
             except Exception as e:
-                logger.error(f"Error posting popular threads for {forum_url}: {e}")
+                logger.error(f"Error posting trending threads for {forum_url}: {e}")
     
     # Post newest threads
     elif now == NEWEST_POST_TIME:
@@ -287,35 +332,35 @@ async def scheduled_posts():
         for forum_url in FORUM_URLS:
             try:
                 scraper = ForumScraper(forum_url)
-                threads = await scraper.get_newest_threads(5)
+                threads = await scraper.get_newest_threads(5, TIME_FILTER_HOURS)
                 await scraper.close_session()
                 
                 forum_name = forum_url.split('/')[-2].replace('-', ' ').title()
-                embed = create_newest_embed(threads, forum_name)
+                embed = create_newest_embed(threads, forum_name, TIME_FILTER_HOURS)
                 await channel.send(embed=embed)
                 
-                await asyncio.sleep(2)  # Rate limit protection
+                await asyncio.sleep(2)
             except Exception as e:
                 logger.error(f"Error posting newest threads for {forum_url}: {e}")
 
 
 @tree.command(
     name="force_trending",
-    description="Manually post the top 5 popular threads right now",
+    description="Manually post the top 5 trending threads from the last 6 hours",
     guild=discord.Object(id=GUILD_ID)
 )
 async def force_trending(interaction: discord.Interaction):
-    """Force post popular threads"""
+    """Force post trending threads"""
     await interaction.response.defer()
     
     for forum_url in FORUM_URLS:
         try:
             scraper = ForumScraper(forum_url)
-            threads = await scraper.get_popular_threads(5)
+            threads = await scraper.get_trending_threads(5, TIME_FILTER_HOURS)
             await scraper.close_session()
             
             forum_name = forum_url.split('/')[-2].replace('-', ' ').title()
-            embed = create_popular_embed(threads, forum_name)
+            embed = create_trending_embed(threads, forum_name, TIME_FILTER_HOURS)
             await interaction.followup.send(embed=embed)
             
             await asyncio.sleep(2)
@@ -326,7 +371,7 @@ async def force_trending(interaction: discord.Interaction):
 
 @tree.command(
     name="force_new",
-    description="Manually post the 5 newest threads right now",
+    description="Manually post the 5 newest threads from the last 6 hours",
     guild=discord.Object(id=GUILD_ID)
 )
 async def force_new(interaction: discord.Interaction):
@@ -336,11 +381,11 @@ async def force_new(interaction: discord.Interaction):
     for forum_url in FORUM_URLS:
         try:
             scraper = ForumScraper(forum_url)
-            threads = await scraper.get_newest_threads(5)
+            threads = await scraper.get_newest_threads(5, TIME_FILTER_HOURS)
             await scraper.close_session()
             
             forum_name = forum_url.split('/')[-2].replace('-', ' ').title()
-            embed = create_newest_embed(threads, forum_name)
+            embed = create_newest_embed(threads, forum_name, TIME_FILTER_HOURS)
             await interaction.followup.send(embed=embed)
             
             await asyncio.sleep(2)
@@ -361,8 +406,9 @@ async def status(interaction: discord.Interaction):
         color=discord.Color.blue(),
         timestamp=datetime.utcnow()
     )
-    embed.add_field(name="Popular Posts Time", value=POPULAR_POST_TIME, inline=False)
+    embed.add_field(name="Trending Posts Time", value=POPULAR_POST_TIME, inline=False)
     embed.add_field(name="Newest Posts Time", value=NEWEST_POST_TIME, inline=False)
+    embed.add_field(name="Time Filter", value=f"Last {TIME_FILTER_HOURS} hours", inline=False)
     embed.add_field(name="Monitored Forums", value='\n'.join(FORUM_URLS), inline=False)
     embed.add_field(name="Target Channel", value=f"<#{CHANNEL_ID}>", inline=False)
     embed.set_footer(text="ColiBot")

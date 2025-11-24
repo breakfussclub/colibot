@@ -104,6 +104,26 @@ class ForumScraper:
         if self.session:
             await self.session.close()
     
+    def parse_number(self, text: str) -> int:
+        """Parse number strings with K/M suffixes"""
+        if not text:
+            return 0
+        
+        text = text.upper().replace(',', '').strip()
+        multiplier = 1
+        
+        if 'K' in text:
+            multiplier = 1000
+            text = text.replace('K', '')
+        elif 'M' in text:
+            multiplier = 1000000
+            text = text.replace('M', '')
+            
+        try:
+            return int(float(text) * multiplier)
+        except ValueError:
+            return 0
+
     async def fetch_page(self, url: str) -> str:
         await self.init_session()
         try:
@@ -158,17 +178,11 @@ class ForumScraper:
                 if len(dds) >= 2:
                     try:
                         # First dd is usually replies, second is views
-                        replies_text = dds[0].get_text(strip=True).replace(',', '')
-                        views_text = dds[1].get_text(strip=True).replace(',', '')
+                        replies_text = dds[0].get_text(strip=True)
+                        views_text = dds[1].get_text(strip=True)
                         
-                        # Extract just the numbers
-                        replies_match = re.search(r'(\d+)', replies_text)
-                        views_match = re.search(r'(\d+)', views_text)
-                        
-                        if replies_match:
-                            replies = int(replies_match.group(1))
-                        if views_match:
-                            views = int(views_match.group(1))
+                        replies = self.parse_number(replies_text)
+                        views = self.parse_number(views_text)
                     except (ValueError, AttributeError) as e:
                         logger.debug(f"Could not parse stats: {e}")
             
@@ -386,14 +400,24 @@ async def get_trending_from_db(limit: int = 5, hours: int = 6) -> List[Dict]:
             
             results = []
             for row in rows:
+                # Format growth display with K/M if needed
+                reply_growth = row['reply_growth']
+                view_growth = row['view_growth']
+                
+                reply_str = f"+{reply_growth}"
+                view_str = f"+{view_growth}"
+                
+                if view_growth >= 1000:
+                    view_str = f"+{view_growth/1000:.1f}K"
+                
                 results.append({
                     'title': row['title'],
                     'url': row['url'],
                     'author': row['author'],
                     'replies': row['current_replies'],
                     'views': row['current_views'],
-                    'score': row['reply_growth'] + (row['view_growth'] / 100), # Velocity score
-                    'growth_display': f"📈 +{row['reply_growth']} replies in last {hours}h"
+                    'score': reply_growth, # Sort score is just raw reply growth
+                    'growth_display': f"📈 {reply_str} replies, {view_str} views in last {hours}h"
                 })
             
             return results

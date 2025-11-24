@@ -1,5 +1,4 @@
-discord.py
-feedparser
-apscheduler
-beautifulsoup4
-aiohttp
+discord.py==2.3.2
+aiohttp==3.9.1
+beautifulsoup4==4.12.2
+python-dotenv==1.0.0

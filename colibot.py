@@ -439,7 +439,7 @@ async def get_trending_from_db(limit: int = 5, hours: int = 6) -> List[Dict]:
         return []
 
 
-@tasks.loop(minutes=60)
+@tasks.loop(minutes=15)
 async def scheduled_scraper():
     """Background task to scrape threads and save snapshots"""
     logger.info("Starting scheduled scrape for snapshots...")
@@ -462,6 +462,34 @@ async def scheduled_scraper():
             
         except Exception as e:
             logger.error(f"Error in scheduled_scraper for {forum_url}: {e}")
+
+
+@tasks.loop(hours=24)
+async def cleanup_old_data():
+    """Delete snapshots older than 7 days to keep DB size manageable"""
+    if not db_pool:
+        return
+        
+    try:
+        logger.info("Starting daily data cleanup...")
+        async with db_pool.acquire() as conn:
+            # Delete old snapshots
+            result = await conn.execute('''
+                DELETE FROM colibot_thread_snapshots 
+                WHERE captured_at < NOW() - interval '7 days'
+            ''')
+            logger.info(f"Cleanup complete: {result}")
+            
+            # Optional: Delete threads that haven't been updated in 30 days
+            # This keeps the main table clean of dead threads
+            result_threads = await conn.execute('''
+                DELETE FROM colibot_threads
+                WHERE updated_at < NOW() - interval '30 days'
+            ''')
+            logger.info(f"Thread cleanup complete: {result_threads}")
+            
+    except Exception as e:
+        logger.error(f"Error in cleanup_old_data: {e}")
 
 
 def create_trending_embed(threads: List[Dict], forum_name: str, hours: int) -> discord.Embed:
@@ -552,6 +580,8 @@ async def on_ready():
     await init_db()
     if not scheduled_scraper.is_running():
         scheduled_scraper.start()
+    if not cleanup_old_data.is_running():
+        cleanup_old_data.start()
 
 
 @tasks.loop(minutes=1)

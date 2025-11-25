@@ -449,7 +449,7 @@ async def get_trending_from_db(limit: int = 5, hours: int = 6) -> List[Dict]:
         return []
 
 
-@tasks.loop(minutes=15)
+@tasks.loop(hours=5)
 async def scheduled_scraper():
     """Background task to scrape threads and save snapshots"""
     logger.info("Starting scheduled scrape for snapshots...")

@@ -126,16 +126,25 @@ class ForumScraper:
 
     async def fetch_page(self, url: str) -> str:
         await self.init_session()
-        try:
-            async with self.session.get(url, timeout=30) as response:
-                if response.status == 200:
-                    return await response.text()
+        for attempt in range(3):
+            try:
+                async with self.session.get(url, timeout=30) as response:
+                    if response.status == 200:
+                        return await response.text()
+                    else:
+                        logger.error(f"Failed to fetch {url}: Status {response.status}")
+                        if response.status >= 500:
+                            # Retry on server errors
+                            await asyncio.sleep(2 ** attempt)
+                            continue
+                        return None
+            except Exception as e:
+                logger.error(f"Error fetching {url} (Attempt {attempt+1}/3): {e}")
+                if attempt < 2:
+                    await asyncio.sleep(2 ** attempt)
                 else:
-                    logger.error(f"Failed to fetch {url}: Status {response.status}")
                     return None
-        except Exception as e:
-            logger.error(f"Error fetching {url}: {e}")
-            return None
+        return None
     
     def parse_thread_element(self, element, base_url: str) -> Dict:
         """Parse a single thread element and extract all data"""
@@ -406,7 +415,7 @@ async def get_trending_from_db(limit: int = 5, hours: int = 6) -> List[Dict]:
                 LEFT JOIN past_snapshots p ON l.thread_id = p.thread_id
                 JOIN colibot_threads t ON l.thread_id = t.thread_id
                 WHERE l.captured_at > NOW() - interval '1 hour'
-                ORDER BY reply_growth DESC, view_growth DESC
+                ORDER BY (reply_growth * 10 + view_growth) DESC
                 LIMIT $2
             ''', float(hours), limit)
             

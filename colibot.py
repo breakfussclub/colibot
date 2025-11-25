@@ -25,6 +25,7 @@ GUILD_ID = int(os.getenv('GUILD_ID'))
 DATABASE_URL = os.getenv('DATABASE_URL')
 POPULAR_POST_TIME = os.getenv('POPULAR_POST_TIME', '09:00')
 NEWEST_POST_TIME = os.getenv('NEWEST_POST_TIME', '18:00')
+POST_INTERVAL_HOURS = int(os.getenv('POST_INTERVAL_HOURS', '3'))  # Default every 3 hours
 FORUM_URLS = os.getenv('FORUM_URLS', 'https://www.thecoli.com/forums/the-locker-room.6/').split(',')
 TIME_FILTER_HOURS = int(os.getenv('TIME_FILTER_HOURS', '6'))  # Default 6 hours
 
@@ -571,7 +572,7 @@ def create_newest_embed(threads: List[Dict], forum_name: str, hours: int) -> dis
 @bot.event
 async def on_ready():
     logger.info(f'{bot.user} has connected to Discord!')
-    logger.info(f'Popular posts scheduled for: {POPULAR_POST_TIME}')
+    logger.info(f'Trending posts interval: Every {POST_INTERVAL_HOURS} hours')
     logger.info(f'Newest posts scheduled for: {NEWEST_POST_TIME}')
     logger.info(f'Time filter: Last {TIME_FILTER_HOURS} hours')
     logger.info(f'Monitoring forums: {FORUM_URLS}')
@@ -603,8 +604,10 @@ async def scheduled_posts():
         logger.error(f"Channel {CHANNEL_ID} not found")
         return
     
-    # Post trending threads
-    if now == POPULAR_POST_TIME:
+    # Post trending threads - Check if we hit the interval hour
+    # We check if minute is 0 and hour is divisible by interval
+    now_dt = datetime.now()
+    if now_dt.minute == 0 and now_dt.hour % POST_INTERVAL_HOURS == 0:
         logger.info("Posting trending threads...")
         for forum_url in FORUM_URLS:
             try:
@@ -711,7 +714,7 @@ async def status(interaction: discord.Interaction):
         color=discord.Color.blue(),
         timestamp=datetime.utcnow()
     )
-    embed.add_field(name="Trending Posts Time", value=POPULAR_POST_TIME, inline=False)
+    embed.add_field(name="Trending Posts Interval", value=f"Every {POST_INTERVAL_HOURS} hours", inline=False)
     embed.add_field(name="Newest Posts Time", value=NEWEST_POST_TIME, inline=False)
     embed.add_field(name="Time Filter", value=f"Last {TIME_FILTER_HOURS} hours", inline=False)
     embed.add_field(name="Monitored Forums", value='\n'.join(FORUM_URLS), inline=False)

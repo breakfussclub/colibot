@@ -9,7 +9,7 @@ import asyncio
 from typing import List, Dict, Optional
 import logging
 import re
-
+import aiosqlite
 
 # Configure logging
 logging.basicConfig(
@@ -28,6 +28,9 @@ POST_INTERVAL_HOURS = int(os.getenv('POST_INTERVAL_HOURS', '3'))  # Default ever
 FORUM_URLS = os.getenv('FORUM_URLS', 'https://www.thecoli.com/forums/the-locker-room.6/').split(',')
 TIME_FILTER_HOURS = int(os.getenv('TIME_FILTER_HOURS', '6'))  # Default 6 hours
 
+# Global DB Connection
+db_path = "colibot.db"
+
 
 # Bot setup
 intents = discord.Intents.default()
@@ -37,7 +40,46 @@ tree = app_commands.CommandTree(bot)
 
 
 
-
+async def init_db():
+    """Initialize SQLite database and schema"""
+    try:
+        async with aiosqlite.connect(db_path) as db:
+            # Create threads table
+            await db.execute('''
+                CREATE TABLE IF NOT EXISTS colibot_threads (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    thread_id TEXT UNIQUE NOT NULL,
+                    title TEXT NOT NULL,
+                    url TEXT NOT NULL,
+                    author TEXT,
+                    created_at TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            
+            # Create snapshots table
+            await db.execute('''
+                CREATE TABLE IF NOT EXISTS colibot_thread_snapshots (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    thread_id TEXT REFERENCES colibot_threads(thread_id),
+                    replies INTEGER,
+                    views INTEGER,
+                    captured_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            
+            # Create index for faster querying
+            await db.execute('''
+                CREATE INDEX IF NOT EXISTS idx_colibot_snapshots_thread_time 
+                ON colibot_thread_snapshots(thread_id, captured_at)
+            ''')
+            
+            await db.commit()
+            
+        logger.info("SQLite database initialized")
+            
+    except Exception as e:
+        logger.error(f"Failed to initialize database: {e}")
 
 
 class ForumScraper:
@@ -301,7 +343,174 @@ class ForumScraper:
 
 
 
+async def save_thread_snapshot(thread_data: Dict):
+    """Save thread data and snapshot to database"""
+    if not thread_data.get('id'):
+        return
 
+    try:
+        async with aiosqlite.connect(db_path) as db:
+            # Check if the latest snapshot is identical to current data
+            async with db.execute('''
+                SELECT replies, views FROM colibot_thread_snapshots 
+                WHERE thread_id = ? 
+                ORDER BY captured_at DESC 
+                LIMIT 1
+            ''', (thread_data['id'],)) as cursor:
+                latest = await cursor.fetchone()
+            
+            if latest and latest[0] == thread_data['replies'] and latest[1] == thread_data['views']:
+                logger.debug(f"Skipping snapshot for thread {thread_data['id']} (no change)")
+                return
+
+            # Upsert thread info
+            await db.execute('''
+                INSERT INTO colibot_threads (thread_id, title, url, author, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(thread_id) DO UPDATE 
+                SET title = excluded.title, url = excluded.url, updated_at = CURRENT_TIMESTAMP
+            ''', (thread_data['id'], thread_data['title'], thread_data['url'], 
+                 thread_data['author'], thread_data['created_at']))
+            
+            # Insert snapshot
+            await db.execute('''
+                INSERT INTO colibot_thread_snapshots (thread_id, replies, views)
+                VALUES (?, ?, ?)
+            ''', (thread_data['id'], thread_data['replies'], thread_data['views']))
+            
+            await db.commit()
+            
+    except Exception as e:
+        logger.error(f"Error saving snapshot for thread {thread_data.get('id')}: {e}")
+
+
+async def get_trending_from_db(limit: int = 5, hours: int = 6) -> List[Dict]:
+    """Get trending threads based on velocity (growth) from DB"""
+    try:
+        async with aiosqlite.connect(db_path) as db:
+            db.row_factory = aiosqlite.Row
+            
+            # Calculate growth: (current_replies - past_replies)
+            # SQLite doesn't have DISTINCT ON, so we use MAX(captured_at) + GROUP BY
+            
+            # We need two CTEs:
+            # 1. Latest snapshot for each thread
+            # 2. Snapshot closest to X hours ago (but not older than X+1 hours ideally, or just the oldest in range)
+            
+            query = '''
+                WITH latest_snapshots AS (
+                    SELECT s.thread_id, s.replies, s.views, s.captured_at
+                    FROM colibot_thread_snapshots s
+                    INNER JOIN (
+                        SELECT thread_id, MAX(captured_at) as max_date
+                        FROM colibot_thread_snapshots
+                        GROUP BY thread_id
+                    ) m ON s.thread_id = m.thread_id AND s.captured_at = m.max_date
+                ),
+                past_snapshots AS (
+                    SELECT s.thread_id, s.replies, s.views, s.captured_at
+                    FROM colibot_thread_snapshots s
+                    INNER JOIN (
+                        SELECT thread_id, MAX(captured_at) as max_date
+                        FROM colibot_thread_snapshots
+                        WHERE captured_at <= datetime('now', '-' || ? || ' hours')
+                        GROUP BY thread_id
+                    ) m ON s.thread_id = m.thread_id AND s.captured_at = m.max_date
+                )
+                SELECT 
+                    t.title, t.url, t.author,
+                    l.replies as current_replies,
+                    l.views as current_views,
+                    (l.replies - COALESCE(p.replies, 0)) as reply_growth,
+                    (l.views - COALESCE(p.views, 0)) as view_growth
+                FROM latest_snapshots l
+                LEFT JOIN past_snapshots p ON l.thread_id = p.thread_id
+                JOIN colibot_threads t ON l.thread_id = t.thread_id
+                WHERE l.captured_at > datetime('now', '-1 hour')
+                ORDER BY (reply_growth * 10 + view_growth) DESC
+                LIMIT ?
+            '''
+            
+            async with db.execute(query, (str(hours), limit)) as cursor:
+                rows = await cursor.fetchall()
+            
+            results = []
+            for row in rows:
+                # Format growth display with K/M if needed
+                reply_growth = row['reply_growth']
+                view_growth = row['view_growth']
+                
+                reply_str = f"+{reply_growth}"
+                view_str = f"+{view_growth}"
+                
+                if view_growth >= 1000:
+                    view_str = f"+{view_growth/1000:.1f}K"
+                
+                results.append({
+                    'title': row['title'],
+                    'url': row['url'],
+                    'author': row['author'],
+                    'replies': row['current_replies'],
+                    'views': row['current_views'],
+                    'score': reply_growth, 
+                    'growth_display': f"📈 {reply_str} replies, {view_str} views in last {hours}h"
+                })
+            
+            return results
+            
+    except Exception as e:
+        logger.error(f"Error fetching trending from DB: {e}")
+        return []
+
+
+@tasks.loop(hours=5)
+async def scheduled_scraper():
+    """Background task to scrape threads and save snapshots"""
+    logger.info("Starting scheduled scrape for snapshots...")
+    for forum_url in FORUM_URLS:
+        try:
+            scraper = ForumScraper(forum_url)
+            # Fetch trending (active) threads to capture activity
+            # We fetch a larger number to ensure we catch active threads from the last 24h
+            threads = await scraper.get_trending_threads(limit=40, hours=24)
+            await scraper.close_session()
+            
+            count = 0
+            for thread in threads:
+                if thread.get('id'):
+                    await save_thread_snapshot(thread)
+                    count += 1
+            
+            logger.info(f"Saved snapshots for {count} threads from {forum_url}")
+            await asyncio.sleep(5) # Be nice to the server
+            
+        except Exception as e:
+            logger.error(f"Error in scheduled_scraper for {forum_url}: {e}")
+
+
+@tasks.loop(hours=24)
+async def cleanup_old_data():
+    """Delete snapshots older than 7 days to keep DB size manageable"""
+    try:
+        logger.info("Starting daily data cleanup...")
+        async with aiosqlite.connect(db_path) as db:
+            # Delete old snapshots
+            await db.execute('''
+                DELETE FROM colibot_thread_snapshots 
+                WHERE captured_at < datetime('now', '-7 days')
+            ''')
+            
+            # Optional: Delete threads that haven't been updated in 30 days
+            await db.execute('''
+                DELETE FROM colibot_threads
+                WHERE updated_at < datetime('now', '-30 days')
+            ''')
+            
+            await db.commit()
+            logger.info("Cleanup complete")
+            
+    except Exception as e:
+        logger.error(f"Error in cleanup_old_data: {e}")
 def create_trending_embed(threads: List[Dict], forum_name: str, hours: int) -> discord.Embed:
     """Create Discord embed for trending threads"""
     embed = discord.Embed(
@@ -387,11 +596,11 @@ async def on_ready():
         scheduled_posts.start()
     
     # Initialize DB and start scraper
-    # await init_db()
-    # if not scheduled_scraper.is_running():
-    #     scheduled_scraper.start()
-    # if not cleanup_old_data.is_running():
-    #     cleanup_old_data.start()
+    await init_db()
+    if not scheduled_scraper.is_running():
+        scheduled_scraper.start()
+    if not cleanup_old_data.is_running():
+        cleanup_old_data.start()
 
 
 @tasks.loop(minutes=1)
@@ -412,15 +621,14 @@ async def scheduled_posts():
         for forum_url in FORUM_URLS:
             try:
                 # Try to get from DB first
-                # threads = await get_trending_from_db(5, TIME_FILTER_HOURS)
+                threads = await get_trending_from_db(5, TIME_FILTER_HOURS)
                 
                 # Fallback if DB returns nothing (e.g. first run)
-                # if not threads:
-                #     logger.info("No DB stats yet, falling back to scraper")
-                logger.info("Fetching trending threads via scraper")
-                scraper = ForumScraper(forum_url)
-                threads = await scraper.get_trending_threads(5, TIME_FILTER_HOURS)
-                await scraper.close_session()
+                if not threads:
+                    logger.info("No DB stats yet, falling back to scraper")
+                    scraper = ForumScraper(forum_url)
+                    threads = await scraper.get_trending_threads(5, TIME_FILTER_HOURS)
+                    await scraper.close_session()
                 
                 forum_name = forum_url.split('/')[-2].replace('-', ' ').title()
                 embed = create_trending_embed(threads, forum_name, TIME_FILTER_HOURS)
@@ -460,13 +668,13 @@ async def force_trending(interaction: discord.Interaction):
     for forum_url in FORUM_URLS:
         try:
             # Try to get from DB first
-            # threads = await get_trending_from_db(5, TIME_FILTER_HOURS)
+            threads = await get_trending_from_db(5, TIME_FILTER_HOURS)
             
             # Fallback
-            # if not threads:
-            scraper = ForumScraper(forum_url)
-            threads = await scraper.get_trending_threads(5, TIME_FILTER_HOURS)
-            await scraper.close_session()
+            if not threads:
+                scraper = ForumScraper(forum_url)
+                threads = await scraper.get_trending_threads(5, TIME_FILTER_HOURS)
+                await scraper.close_session()
             
             forum_name = forum_url.split('/')[-2].replace('-', ' ').title()
             embed = create_trending_embed(threads, forum_name, TIME_FILTER_HOURS)

@@ -435,7 +435,7 @@ async def get_trending_from_db(limit: int = 5, hours: int = 6) -> List[Dict]:
                 LEFT JOIN past_snapshots p ON l.thread_id = p.thread_id
                 JOIN colibot_threads t ON l.thread_id = t.thread_id
                 WHERE l.captured_at > datetime('now', '-1 hour')
-                ORDER BY reply_growth DESC
+                ORDER BY reply_growth DESC, t.created_at DESC
                 LIMIT ?
             '''
             
@@ -450,11 +450,10 @@ async def get_trending_from_db(limit: int = 5, hours: int = 6) -> List[Dict]:
                 reply_growth = row['reply_growth']
                 view_growth = row['view_growth']
                 
-                reply_str = f"+{reply_growth}"
-                view_str = f"+{view_growth}"
                 
-                if view_growth >= 1000:
-                    view_str = f"+{view_growth/1000:.1f}K"
+                growth_display = ""
+                if reply_growth > 0:
+                    growth_display = f"📈 +{reply_growth} replies in last {hours}h"
                 
                 results.append({
                     'title': row['title'],
@@ -463,7 +462,7 @@ async def get_trending_from_db(limit: int = 5, hours: int = 6) -> List[Dict]:
                     'replies': row['current_replies'],
                     'views': row['current_views'],
                     'score': reply_growth, 
-                    'growth_display': f"📈 {reply_str} replies, {view_str} views in last {hours}h"
+                    'growth_display': growth_display
                 })
             
             return results

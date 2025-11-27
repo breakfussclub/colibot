@@ -587,6 +587,8 @@ async def get_trending_from_db(limit: int = 5, hours: int = 6) -> tuple[List[Dic
                     heat_emoji = "🔥" # Hot
                 elif reply_growth >= 5:
                     heat_emoji = "📈" # Rising
+                elif reply_growth > 0:
+                    heat_emoji = "🌱" # Growing
                 
                 growth_display = ""
                 if reply_growth > 0:
@@ -654,7 +656,7 @@ async def get_trending_from_db(limit: int = 5, hours: int = 6) -> tuple[List[Dic
         return [], None
 
 
-@tasks.loop(hours=5)
+@tasks.loop(minutes=30)
 async def scheduled_scraper():
     """Background task to scrape threads and save snapshots"""
     logger.info("Starting scheduled scrape for snapshots...")

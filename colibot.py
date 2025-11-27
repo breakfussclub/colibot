@@ -421,8 +421,16 @@ async def get_trending_from_db(limit: int = 5, hours: int = 6) -> List[Dict]:
                     t.title, t.url, t.author,
                     l.replies as current_replies,
                     l.views as current_views,
-                    (l.replies - COALESCE(p.replies, 0)) as reply_growth,
-                    (l.views - COALESCE(p.views, 0)) as view_growth
+                    CASE 
+                        WHEN p.replies IS NOT NULL THEN (l.replies - p.replies)
+                        WHEN t.created_at > datetime('now', '-' || ? || ' hours') THEN l.replies
+                        ELSE 0 
+                    END as reply_growth,
+                    CASE 
+                        WHEN p.views IS NOT NULL THEN (l.views - p.views)
+                        WHEN t.created_at > datetime('now', '-' || ? || ' hours') THEN l.views
+                        ELSE 0 
+                    END as view_growth
                 FROM latest_snapshots l
                 LEFT JOIN past_snapshots p ON l.thread_id = p.thread_id
                 JOIN colibot_threads t ON l.thread_id = t.thread_id
@@ -431,7 +439,9 @@ async def get_trending_from_db(limit: int = 5, hours: int = 6) -> List[Dict]:
                 LIMIT ?
             '''
             
-            async with db.execute(query, (str(hours), limit)) as cursor:
+            # We need to pass 'hours' multiple times now for the parameters
+            # Params: past_snapshot_hours, created_at_hours_reply, created_at_hours_view, limit
+            async with db.execute(query, (str(hours), str(hours), str(hours), limit)) as cursor:
                 rows = await cursor.fetchall()
             
             results = []

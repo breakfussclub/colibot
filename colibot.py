@@ -10,6 +10,8 @@ from typing import List, Dict, Optional
 import logging
 import re
 import aiosqlite
+import urllib.parse
+import json
 
 # Configure logging
 logging.basicConfig(
@@ -339,6 +341,42 @@ class ForumScraper:
         
         return threads[:limit]
 
+    async def search_threads(self, query: str, limit: int = 5) -> List[Dict]:
+        """Search for threads by keyword"""
+        base_url = self.forum_url.split('/forums/')[0]
+        search_url = f"{base_url}/search/search"
+        
+        await self.init_session()
+        try:
+            # XenForo search is usually a POST
+            data = {
+                'keywords': query,
+                'c[title_only]': 1, # Search titles only for better relevance
+                'order': 'relevance'
+            }
+            
+            async with self.session.post(search_url, data=data) as response:
+                if response.status == 200:
+                    html = await response.text()
+                    soup = BeautifulSoup(html, 'html.parser')
+                    
+                    threads = []
+                    # Search results are usually in structItem--thread
+                    thread_elements = soup.find_all('div', class_='structItem--thread', limit=limit)
+                    
+                    for element in thread_elements:
+                        thread_data = self.parse_thread_element(element, base_url)
+                        if thread_data:
+                            threads.append(thread_data)
+                            
+                    return threads
+                else:
+                    logger.error(f"Search failed with status {response.status}")
+                    return []
+        except Exception as e:
+            logger.error(f"Error searching threads: {e}")
+            return []
+
 
 
 
@@ -384,7 +422,96 @@ async def save_thread_snapshot(thread_data: Dict):
         logger.error(f"Error saving snapshot for thread {thread_data.get('id')}: {e}")
 
 
-async def get_trending_from_db(limit: int = 5, hours: int = 6) -> List[Dict]:
+
+def generate_chart_url(data: Dict[str, List[tuple]]) -> str:
+    """Generate a QuickChart URL for thread growth"""
+    try:
+        # Prepare datasets
+        datasets = []
+        colors = ['#FF6384', '#36A2EB', '#FFCE56', '#4BC0C0', '#9966FF']
+        
+        # Find the common time range
+        all_times = set()
+        for points in data.values():
+            for t, _ in points:
+                all_times.add(t)
+        
+        sorted_times = sorted(list(all_times))
+        # Keep only last 10-15 points to avoid clutter
+        if len(sorted_times) > 15:
+            sorted_times = sorted_times[-15:]
+            
+        labels = [t.strftime('%H:%M') for t in sorted_times]
+        
+        for i, (title, points) in enumerate(data.items()):
+            # Map points to the common time axis
+            point_map = {t: r for t, r in points}
+            data_points = []
+            last_val = 0
+            
+            for t in sorted_times:
+                if t in point_map:
+                    last_val = point_map[t]
+                    data_points.append(last_val)
+                else:
+                    # Fill gaps with last known value or None
+                    data_points.append(last_val if last_val > 0 else None)
+            
+            datasets.append({
+                'label': title[:20] + '...',
+                'data': data_points,
+                'borderColor': colors[i % len(colors)],
+                'fill': False,
+                'borderWidth': 2,
+                'pointRadius': 0
+            })
+            
+        config = {
+            'type': 'line',
+            'data': {
+                'labels': labels,
+                'datasets': datasets
+            },
+            'options': {
+                'title': {
+                    'display': True,
+                    'text': 'Reply Growth (Last 6 Hours)',
+                    'fontColor': '#fff'
+                },
+                'legend': {
+                    'position': 'bottom',
+                    'labels': {
+                        'fontColor': '#fff',
+                        'fontSize': 10
+                    }
+                },
+                'scales': {
+                    'xAxes': [{
+                        'ticks': {'fontColor': '#ccc'}
+                    }],
+                    'yAxes': [{
+                        'ticks': {'fontColor': '#ccc'}
+                    }]
+                }
+            }
+        }
+        
+        # QuickChart URL
+        base = "https://quickchart.io/chart"
+        params = {
+            'c': json.dumps(config),
+            'w': 500,
+            'h': 300,
+            'bkg': '#2f3136' # Discord dark mode background
+        }
+        return f"{base}?{urllib.parse.urlencode(params)}"
+        
+    except Exception as e:
+        logger.error(f"Error generating chart: {e}")
+        return None
+
+
+async def get_trending_from_db(limit: int = 5, hours: int = 6) -> tuple[List[Dict], Optional[str]]:
     """Get trending threads based on velocity (growth) from DB"""
     try:
         async with aiosqlite.connect(db_path) as db:
@@ -445,31 +572,86 @@ async def get_trending_from_db(limit: int = 5, hours: int = 6) -> List[Dict]:
                 rows = await cursor.fetchall()
             
             results = []
+            thread_ids = []
+            
             for row in rows:
                 # Format growth display with K/M if needed
                 reply_growth = row['reply_growth']
                 view_growth = row['view_growth']
                 
+                # Heat System
+                heat_emoji = ""
+                if reply_growth >= 50:
+                    heat_emoji = "🌋" # Eruption
+                elif reply_growth >= 20:
+                    heat_emoji = "🔥" # Hot
+                elif reply_growth >= 5:
+                    heat_emoji = "📈" # Rising
                 
                 growth_display = ""
                 if reply_growth > 0:
-                    growth_display = f"📈 +{reply_growth} replies in last {hours}h"
+                    growth_display = f"{heat_emoji} +{reply_growth} replies in last {hours}h"
                 
                 results.append({
+                    'id': row['thread_id'], # Needed for chart history
                     'title': row['title'],
                     'url': row['url'],
                     'author': row['author'],
                     'replies': row['current_replies'],
                     'views': row['current_views'],
                     'score': reply_growth, 
-                    'growth_display': growth_display
+                    'growth_display': growth_display,
+                    'heat_emoji': heat_emoji
                 })
+                thread_ids.append(row['thread_id'])
             
-            return results
+            # Generate Chart
+            chart_url = None
+            if results:
+                try:
+                    # Fetch history for these threads
+                    placeholders = ','.join('?' for _ in thread_ids)
+                    history_query = f'''
+                        SELECT thread_id, replies, captured_at 
+                        FROM colibot_thread_snapshots 
+                        WHERE thread_id IN ({placeholders}) 
+                        AND captured_at > datetime('now', '-' || ? || ' hours')
+                        ORDER BY captured_at ASC
+                    '''
+                    params = list(thread_ids)
+                    params.append(str(hours))
+                    
+                    async with db.execute(history_query, params) as cursor:
+                        history_rows = await cursor.fetchall()
+                        
+                    # Organize data for chart
+                    chart_data = {} # {title: [(time, replies), ...]}
+                    
+                    # Map IDs to titles
+                    id_to_title = {t['id']: t['title'] for t in results}
+                    
+                    for h_row in history_rows:
+                        tid = h_row[0] # thread_id
+                        replies = h_row[1]
+                        captured_at = datetime.fromisoformat(h_row[2])
+                        
+                        if tid in id_to_title:
+                            title = id_to_title[tid]
+                            if title not in chart_data:
+                                chart_data[title] = []
+                            chart_data[title].append((captured_at, replies))
+                            
+                    if chart_data:
+                        chart_url = generate_chart_url(chart_data)
+                        
+                except Exception as e:
+                    logger.error(f"Error fetching history for chart: {e}")
+            
+            return results, chart_url
             
     except Exception as e:
         logger.error(f"Error fetching trending from DB: {e}")
-        return []
+        return [], None
 
 
 @tasks.loop(hours=5)
@@ -520,7 +702,7 @@ async def cleanup_old_data():
             
     except Exception as e:
         logger.error(f"Error in cleanup_old_data: {e}")
-def create_trending_embed(threads: List[Dict], forum_name: str, hours: int) -> discord.Embed:
+def create_trending_embed(threads: List[Dict], forum_name: str, hours: int, chart_url: str = None) -> discord.Embed:
     """Create Discord embed for trending threads"""
     embed = discord.Embed(
         title="🔥 Trending Threads",
@@ -554,6 +736,10 @@ def create_trending_embed(threads: List[Dict], forum_name: str, hours: int) -> d
         )
     
     embed.set_footer(text="The Coli • Updates daily", icon_url="https://raw.githubusercontent.com/breakfussclub/colibot/main/assets/colibot_logo.png")
+    
+    if chart_url:
+        embed.set_image(url=chart_url)
+        
     return embed
 
 
@@ -630,7 +816,7 @@ async def scheduled_posts():
         for forum_url in FORUM_URLS:
             try:
                 # Try to get from DB first
-                threads = await get_trending_from_db(5, TIME_FILTER_HOURS)
+                threads, chart_url = await get_trending_from_db(5, TIME_FILTER_HOURS)
                 
                 # Fallback if DB returns nothing (e.g. first run)
                 if not threads:
@@ -640,7 +826,7 @@ async def scheduled_posts():
                     await scraper.close_session()
                 
                 forum_name = forum_url.split('/')[-2].replace('-', ' ').title()
-                embed = create_trending_embed(threads, forum_name, TIME_FILTER_HOURS)
+                embed = create_trending_embed(threads, forum_name, TIME_FILTER_HOURS, chart_url)
                 await channel.send(embed=embed)
                 
                 await asyncio.sleep(2)
@@ -677,7 +863,7 @@ async def force_trending(interaction: discord.Interaction):
     for forum_url in FORUM_URLS:
         try:
             # Try to get from DB first
-            threads = await get_trending_from_db(5, TIME_FILTER_HOURS)
+            threads, chart_url = await get_trending_from_db(5, TIME_FILTER_HOURS)
             
             # Fallback
             if not threads:
@@ -686,7 +872,7 @@ async def force_trending(interaction: discord.Interaction):
                 await scraper.close_session()
             
             forum_name = forum_url.split('/')[-2].replace('-', ' ').title()
-            embed = create_trending_embed(threads, forum_name, TIME_FILTER_HOURS)
+            embed = create_trending_embed(threads, forum_name, TIME_FILTER_HOURS, chart_url)
             await interaction.followup.send(embed=embed)
             
             await asyncio.sleep(2)
@@ -739,6 +925,100 @@ async def status(interaction: discord.Interaction):
     embed.add_field(name="Target Channel", value=f"<#{CHANNEL_ID}>", inline=False)
     embed.set_footer(text="ColiBot")
     await interaction.response.send_message(embed=embed)
+
+
+@tree.command(
+    name="search",
+    description="Search for threads on The Coli",
+    guild=discord.Object(id=GUILD_ID)
+)
+async def search(interaction: discord.Interaction, query: str):
+    """Search for threads"""
+    await interaction.response.defer()
+    
+    try:
+        # Use the first configured forum URL to get the base domain
+        scraper = ForumScraper(FORUM_URLS[0])
+        threads = await scraper.search_threads(query, limit=5)
+        await scraper.close_session()
+        
+        if not threads:
+            await interaction.followup.send(f"No results found for '{query}'.")
+            return
+            
+        embed = discord.Embed(
+            title=f"🔍 Search Results: {query}",
+            color=discord.Color.green(),
+            timestamp=datetime.utcnow()
+        )
+        
+        for i, thread in enumerate(threads, 1):
+            author = thread.get('author', 'Unknown')
+            replies = thread.get('replies', 0)
+            views = thread.get('views', 0)
+            
+            embed.add_field(
+                name=f"#{i}",
+                value=f"[**{thread['title'][:100]}**]({thread['url']})\nby {author} • 💬 {replies:,} • 👁️ {views:,}",
+                inline=False
+            )
+            
+        await interaction.followup.send(embed=embed)
+        
+    except Exception as e:
+        logger.error(f"Error in search command: {e}")
+        await interaction.followup.send(f"❌ Error searching: {str(e)}")
+
+
+@bot.event
+async def on_message(message):
+    # Ignore messages from bot itself
+    if message.author == bot.user:
+        return
+
+    # Smart Link Unfurling
+    # Check if message contains a link to thecoli.com/threads/
+    if "thecoli.com/threads/" in message.content:
+        try:
+            # Extract URL
+            urls = re.findall(r'https?://(?:www\.)?thecoli\.com/threads/[^\s]+', message.content)
+            
+            for url in urls[:1]: # Only unfurl the first link to avoid spam
+                # Scrape the thread details
+                scraper = ForumScraper(url) # URL doesn't matter much here, we just need the instance
+                html = await scraper.fetch_page(url)
+                
+                if html:
+                    soup = BeautifulSoup(html, 'html.parser')
+                    # We need to find the thread title and stats
+                    # The page structure is different for a single thread view vs list view
+                    # But we can grab the title from <h1 class="p-title-value">
+                    
+                    title_elem = soup.find('h1', class_='p-title-value')
+                    if title_elem:
+                        title = title_elem.get_text(strip=True)
+                        
+                        # Author is usually in the first post
+                        author = "Unknown"
+                        author_elem = soup.find('a', class_='username')
+                        if author_elem:
+                            author = author_elem.get_text(strip=True)
+                            
+                        # Create a simple embed
+                        embed = discord.Embed(
+                            title=title,
+                            url=url,
+                            color=0xFF6B35
+                        )
+                        embed.set_author(name=f"Thread by {author}")
+                        embed.set_footer(text="The Coli Unfurler")
+                        
+                        await message.channel.send(embed=embed)
+                        
+                await scraper.close_session()
+                
+        except Exception as e:
+            logger.error(f"Error unfurling link: {e}")
 
 
 if __name__ == "__main__":

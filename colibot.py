@@ -236,7 +236,7 @@ class ForumScraper:
                 'created_at': created_timestamp,
                 'last_post_at': last_post_timestamp,
                 'timestamp_display': timestamp_display,
-                'score': replies + (views / 10)  # Popularity score
+                'score': replies  # Popularity score (Replies only)
             }
         
         except Exception as e:
@@ -435,7 +435,7 @@ async def get_trending_from_db(limit: int = 5, hours: int = 6) -> List[Dict]:
                 LEFT JOIN past_snapshots p ON l.thread_id = p.thread_id
                 JOIN colibot_threads t ON l.thread_id = t.thread_id
                 WHERE l.captured_at > datetime('now', '-1 hour')
-                ORDER BY (reply_growth * 10 + view_growth) DESC
+                ORDER BY reply_growth DESC
                 LIMIT ?
             '''
             

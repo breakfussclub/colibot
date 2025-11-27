@@ -548,8 +548,8 @@ def create_trending_embed(threads: List[Dict], forum_name: str, hours: int) -> d
             stats = f"💬 **{replies:,}** replies  •  👁️ **{views:,}** views"
         
         embed.add_field(
-            name=f"**{i}.** {thread['title'][:100]}",
-            value=f"by {author}\n{stats}\n[→ View Thread]({thread['url']})",
+            name=f"#{i}",
+            value=f"[**{thread['title'][:100]}**]({thread['url']})\nby {author}\n{stats}",
             inline=False
         )
     
@@ -578,8 +578,8 @@ def create_newest_embed(threads: List[Dict], forum_name: str, hours: int) -> dis
         timestamp = thread.get('timestamp_display', 'Recently')
         
         embed.add_field(
-            name=f"**{i}.** {thread['title'][:100]}",
-            value=f"by {author}  •  🕐 {timestamp}\n[→ View Thread]({thread['url']})",
+            name=f"#{i}",
+            value=f"[**{thread['title'][:100]}**]({thread['url']})\nby {author}  •  🕐 {timestamp}",
             inline=False
         )
     

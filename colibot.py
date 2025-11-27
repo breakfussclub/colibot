@@ -22,6 +22,11 @@ logger = logging.getLogger('ColiBot')
 DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
 CHANNEL_ID = int(os.getenv('CHANNEL_ID'))
 GUILD_ID = int(os.getenv('GUILD_ID'))
+POPULAR_POST_TIME = os.getenv('POPULAR_POST_TIME', '09:00')
+NEWEST_POST_TIME = os.getenv('NEWEST_POST_TIME', '18:00')
+POST_INTERVAL_HOURS = int(os.getenv('POST_INTERVAL_HOURS', '3'))  # Default every 3 hours
+FORUM_URLS = os.getenv('FORUM_URLS', 'https://www.thecoli.com/forums/the-locker-room.6/').split(',')
+TIME_FILTER_HOURS = int(os.getenv('TIME_FILTER_HOURS', '6'))  # Default 6 hours
 
 
 # Bot setup

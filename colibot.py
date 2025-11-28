@@ -444,21 +444,14 @@ class ForumScraper:
             # Let's look for .p-body-header-content or similar.
             # Actually, let's just stick to 0 if we can't find it easily, but try to find an image.
             
-            # 4. Image (First image in the first post)
+            # 4. Image (No longer needed as per user request to use standard logo)
             image = None
-            first_post = soup.find('article', class_='message--post')
-            if first_post:
-                img_elem = first_post.find('img', class_='bbImage')
-                if img_elem:
-                    image = img_elem.get('src')
-                    if image and not image.startswith('http'):
-                        image = base_url + image
             
             return {
                 'title': title,
                 'url': url,
                 'author': author,
-                'replies': replies, # Keeping 0 for now as it's hard to scrape from thread view
+                'replies': replies,
                 'views': views,
                 'image': image
             }
@@ -806,7 +799,7 @@ def create_trending_embed(threads: List[Dict], forum_name: str, hours: int, char
             inline=False
         )
     
-    embed.set_footer(text="The Coli • Updates daily", icon_url="https://raw.githubusercontent.com/breakfussclub/colibot/main/assets/colibot_logo.png")
+    embed.set_footer(text="ColiBot • Trending Threads", icon_url="https://raw.githubusercontent.com/breakfussclub/colibot/main/assets/colibot_logo.png")
     
     if chart_url:
         embed.set_image(url=chart_url)
@@ -840,7 +833,7 @@ def create_newest_embed(threads: List[Dict], forum_name: str, hours: int) -> dis
             inline=False
         )
     
-    embed.set_footer(text="The Coli • Updates daily", icon_url="https://raw.githubusercontent.com/breakfussclub/colibot/main/assets/colibot_logo.png")
+    embed.set_footer(text="ColiBot • Newest Threads", icon_url="https://raw.githubusercontent.com/breakfussclub/colibot/main/assets/colibot_logo.png")
     return embed
 
 
@@ -1033,10 +1026,8 @@ async def search(interaction: discord.Interaction, query: str):
                 inline=False
             )
             
-            # Set thumbnail to the first result's image if available
-            if i == 1 and thread.get('image'):
-                embed.set_thumbnail(url=thread['image'])
-        
+        # Use standard logo as thumbnail
+        embed.set_thumbnail(url="https://raw.githubusercontent.com/breakfussclub/colibot/main/assets/colibot_logo.png")
         embed.set_footer(text="ColiBot • Search Results", icon_url="https://raw.githubusercontent.com/breakfussclub/colibot/main/assets/colibot_logo.png")
         await interaction.followup.send(embed=embed)
         

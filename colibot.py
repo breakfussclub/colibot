@@ -502,27 +502,6 @@ async def save_thread_snapshot(thread_data: Dict):
 
 
 
-def generate_chart_url(data: Dict[str, List[tuple]]) -> str:
-    """Generate a QuickChart URL for thread growth"""
-    try:
-        # Prepare datasets
-        datasets = []
-        colors = ['#FF6384', '#36A2EB', '#FFCE56', '#4BC0C0', '#9966FF']
-        
-        # Find the common time range
-        all_times = set()
-        for points in data.values():
-            for t, _ in points:
-                all_times.add(t)
-        
-        sorted_times = sorted(list(all_times))
-        # Keep only last 10-15 points to avoid clutter
-        if len(sorted_times) > 15:
-            sorted_times = sorted_times[-15:]
-            
-        labels = [t.strftime('%H:%M') for t in sorted_times]
-        
-        for i, (title, points) in enumerate(data.items()):
 async def get_trending_from_db(limit: int = 5, hours: int = 6) -> List[Dict]:
     """Get trending threads based on velocity (growth) from DB"""
     if not pool:

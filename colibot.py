@@ -347,36 +347,59 @@ class ForumScraper:
         return threads[:limit]
 
     async def search_threads(self, query: str, limit: int = 5) -> List[Dict]:
-        """Search for threads by keyword"""
-        base_url = self.forum_url.split('/forums/')[0]
-        search_url = f"{base_url}/search/search"
-        
-        await self.init_session()
+        """Search for threads by keyword using DuckDuckGo (bypasses login)"""
         try:
-            # XenForo search is usually a POST
-            data = {
-                'keywords': query,
-                'c[title_only]': 1, # Search titles only for better relevance
-                'order': 'relevance'
+            # Use DuckDuckGo HTML version
+            search_url = "https://html.duckduckgo.com/html/"
+            params = {
+                'q': f"site:thecoli.com {query}",
+                'kl': 'us-en'
             }
             
-            async with self.session.post(search_url, data=data) as response:
+            # Use a real browser User-Agent
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+                'Referer': 'https://html.duckduckgo.com/'
+            }
+            
+            await self.init_session()
+            async with self.session.post(search_url, data=params, headers=headers) as response:
                 if response.status == 200:
                     html = await response.text()
                     soup = BeautifulSoup(html, 'html.parser')
                     
                     threads = []
-                    # Search results are usually in structItem--thread
-                    thread_elements = soup.find_all('div', class_='structItem--thread', limit=limit)
+                    # DDG results are in .result__a
+                    results = soup.find_all('a', class_='result__a', limit=limit)
                     
-                    for element in thread_elements:
-                        thread_data = self.parse_thread_element(element, base_url)
-                        if thread_data:
-                            threads.append(thread_data)
+                    for res in results:
+                        title = res.get_text(strip=True)
+                        raw_url = res.get('href', '')
+                        
+                        # DDG wraps URLs: //duckduckgo.com/l/?uddg=REAL_URL&rut=...
+                        # Or sometimes direct links. Check if it's a wrapper.
+                        thread_url = raw_url
+                        if 'uddg=' in raw_url:
+                            try:
+                                parsed = urllib.parse.parse_qs(urllib.parse.urlparse(raw_url).query)
+                                if 'uddg' in parsed:
+                                    thread_url = parsed['uddg'][0]
+                            except:
+                                pass
+                        
+                        # Only include actual thread links
+                        if '/threads/' in thread_url:
+                            threads.append({
+                                'title': title,
+                                'url': thread_url,
+                                'author': 'Search Result', # DDG doesn't show author easily
+                                'replies': 0, # Can't get stats from DDG
+                                'views': 0
+                            })
                             
                     return threads
                 else:
-                    logger.error(f"Search failed with status {response.status}")
+                    logger.error(f"DDG Search failed with status {response.status}")
                     return []
         except Exception as e:
             logger.error(f"Error searching threads: {e}")

@@ -9,7 +9,7 @@ import asyncio
 from typing import List, Dict, Optional
 import logging
 import re
-import aiosqlite
+import asyncpg
 import urllib.parse
 import json
 
@@ -28,10 +28,9 @@ POPULAR_POST_TIME = os.getenv('POPULAR_POST_TIME', '09:00')
 NEWEST_POST_TIME = os.getenv('NEWEST_POST_TIME', '18:00')
 POST_INTERVAL_HOURS = int(os.getenv('POST_INTERVAL_HOURS', '3'))  # Default every 3 hours
 FORUM_URLS = os.getenv('FORUM_URLS', 'https://www.thecoli.com/forums/the-locker-room.6/').split(',')
-TIME_FILTER_HOURS = int(os.getenv('TIME_FILTER_HOURS', '6'))  # Default 6 hours
-
 # Global DB Connection
-db_path = "colibot.db"
+DATABASE_URL = os.getenv('DATABASE_URL')
+pool = None
 
 
 # Bot setup
@@ -43,42 +42,47 @@ tree = app_commands.CommandTree(bot)
 
 
 async def init_db():
-    """Initialize SQLite database and schema"""
+    """Initialize PostgreSQL database pool and schema"""
+    global pool
     try:
-        async with aiosqlite.connect(db_path) as db:
+        if not DATABASE_URL:
+            logger.error("DATABASE_URL not set!")
+            return
+
+        pool = await asyncpg.create_pool(DATABASE_URL)
+        
+        async with pool.acquire() as conn:
             # Create threads table
-            await db.execute('''
+            await conn.execute('''
                 CREATE TABLE IF NOT EXISTS colibot_threads (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    id SERIAL PRIMARY KEY,
                     thread_id TEXT UNIQUE NOT NULL,
                     title TEXT NOT NULL,
                     url TEXT NOT NULL,
                     author TEXT,
-                    created_at TIMESTAMP,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    created_at TIMESTAMPTZ,
+                    updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
                 )
             ''')
             
             # Create snapshots table
-            await db.execute('''
+            await conn.execute('''
                 CREATE TABLE IF NOT EXISTS colibot_thread_snapshots (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    id SERIAL PRIMARY KEY,
                     thread_id TEXT REFERENCES colibot_threads(thread_id),
                     replies INTEGER,
                     views INTEGER,
-                    captured_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    captured_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
                 )
             ''')
             
             # Create index for faster querying
-            await db.execute('''
+            await conn.execute('''
                 CREATE INDEX IF NOT EXISTS idx_colibot_snapshots_thread_time 
                 ON colibot_thread_snapshots(thread_id, captured_at)
             ''')
             
-            await db.commit()
-            
-        logger.info("SQLite database initialized")
+        logger.info("PostgreSQL database initialized")
             
     except Exception as e:
         logger.error(f"Failed to initialize database: {e}")
@@ -383,40 +387,37 @@ class ForumScraper:
 
 async def save_thread_snapshot(thread_data: Dict):
     """Save thread data and snapshot to database"""
-    if not thread_data.get('id'):
+    if not thread_data.get('id') or not pool:
         return
 
     try:
-        async with aiosqlite.connect(db_path) as db:
+        async with pool.acquire() as conn:
             # Check if the latest snapshot is identical to current data
-            async with db.execute('''
+            latest = await conn.fetchrow('''
                 SELECT replies, views FROM colibot_thread_snapshots 
-                WHERE thread_id = ? 
+                WHERE thread_id = $1 
                 ORDER BY captured_at DESC 
                 LIMIT 1
-            ''', (thread_data['id'],)) as cursor:
-                latest = await cursor.fetchone()
+            ''', thread_data['id'])
             
-            if latest and latest[0] == thread_data['replies'] and latest[1] == thread_data['views']:
+            if latest and latest['replies'] == thread_data['replies'] and latest['views'] == thread_data['views']:
                 logger.debug(f"Skipping snapshot for thread {thread_data['id']} (no change)")
                 return
 
             # Upsert thread info
-            await db.execute('''
+            await conn.execute('''
                 INSERT INTO colibot_threads (thread_id, title, url, author, created_at)
-                VALUES (?, ?, ?, ?, ?)
+                VALUES ($1, $2, $3, $4, $5)
                 ON CONFLICT(thread_id) DO UPDATE 
                 SET title = excluded.title, url = excluded.url, updated_at = CURRENT_TIMESTAMP
-            ''', (thread_data['id'], thread_data['title'], thread_data['url'], 
-                 thread_data['author'], thread_data['created_at']))
+            ''', thread_data['id'], thread_data['title'], thread_data['url'], 
+                 thread_data['author'], thread_data['created_at'])
             
             # Insert snapshot
-            await db.execute('''
+            await conn.execute('''
                 INSERT INTO colibot_thread_snapshots (thread_id, replies, views)
-                VALUES (?, ?, ?)
-            ''', (thread_data['id'], thread_data['replies'], thread_data['views']))
-            
-            await db.commit()
+                VALUES ($1, $2, $3)
+            ''', thread_data['id'], thread_data['replies'], thread_data['views'])
             
     except Exception as e:
         logger.error(f"Error saving snapshot for thread {thread_data.get('id')}: {e}")
@@ -513,63 +514,48 @@ def generate_chart_url(data: Dict[str, List[tuple]]) -> str:
 
 async def get_trending_from_db(limit: int = 5, hours: int = 6) -> tuple[List[Dict], Optional[str]]:
     """Get trending threads based on velocity (growth) from DB"""
+    if not pool:
+        return [], None
+
     try:
-        async with aiosqlite.connect(db_path) as db:
-            db.row_factory = aiosqlite.Row
-            
-            # Calculate growth: (current_replies - past_replies)
-            # SQLite doesn't have DISTINCT ON, so we use MAX(captured_at) + GROUP BY
-            
-            # We need two CTEs:
-            # 1. Latest snapshot for each thread
-            # 2. Snapshot closest to X hours ago (but not older than X+1 hours ideally, or just the oldest in range)
+        async with pool.acquire() as conn:
+            # Postgres version using DISTINCT ON for cleaner logic
             
             query = '''
                 WITH latest_snapshots AS (
-                    SELECT s.thread_id, s.replies, s.views, s.captured_at
-                    FROM colibot_thread_snapshots s
-                    INNER JOIN (
-                        SELECT thread_id, MAX(captured_at) as max_date
-                        FROM colibot_thread_snapshots
-                        GROUP BY thread_id
-                    ) m ON s.thread_id = m.thread_id AND s.captured_at = m.max_date
+                    SELECT DISTINCT ON (thread_id) thread_id, replies, views, captured_at
+                    FROM colibot_thread_snapshots
+                    ORDER BY thread_id, captured_at DESC
                 ),
                 past_snapshots AS (
-                    SELECT s.thread_id, s.replies, s.views, s.captured_at
-                    FROM colibot_thread_snapshots s
-                    INNER JOIN (
-                        SELECT thread_id, MAX(captured_at) as max_date
-                        FROM colibot_thread_snapshots
-                        WHERE captured_at <= datetime('now', '-' || ? || ' hours')
-                        GROUP BY thread_id
-                    ) m ON s.thread_id = m.thread_id AND s.captured_at = m.max_date
+                    SELECT DISTINCT ON (thread_id) thread_id, replies, views, captured_at
+                    FROM colibot_thread_snapshots
+                    WHERE captured_at <= NOW() - ($1 || ' hours')::INTERVAL
+                    ORDER BY thread_id, captured_at DESC
                 )
                 SELECT 
-                    t.title, t.url, t.author,
+                    t.title, t.url, t.author, t.thread_id,
                     l.replies as current_replies,
                     l.views as current_views,
                     CASE 
                         WHEN p.replies IS NOT NULL THEN (l.replies - p.replies)
-                        WHEN t.created_at > datetime('now', '-' || ? || ' hours') THEN l.replies
+                        WHEN t.created_at > NOW() - ($2 || ' hours')::INTERVAL THEN l.replies
                         ELSE 0 
                     END as reply_growth,
                     CASE 
                         WHEN p.views IS NOT NULL THEN (l.views - p.views)
-                        WHEN t.created_at > datetime('now', '-' || ? || ' hours') THEN l.views
+                        WHEN t.created_at > NOW() - ($3 || ' hours')::INTERVAL THEN l.views
                         ELSE 0 
                     END as view_growth
                 FROM latest_snapshots l
                 LEFT JOIN past_snapshots p ON l.thread_id = p.thread_id
                 JOIN colibot_threads t ON l.thread_id = t.thread_id
-                WHERE l.captured_at > datetime('now', '-1 hour')
+                WHERE l.captured_at > NOW() - INTERVAL '1 hour'
                 ORDER BY reply_growth DESC, t.created_at DESC
-                LIMIT ?
+                LIMIT $4
             '''
             
-            # We need to pass 'hours' multiple times now for the parameters
-            # Params: past_snapshot_hours, created_at_hours_reply, created_at_hours_view, limit
-            async with db.execute(query, (str(hours), str(hours), str(hours), limit)) as cursor:
-                rows = await cursor.fetchall()
+            rows = await conn.fetch(query, str(hours), str(hours), str(hours), limit)
             
             results = []
             thread_ids = []
@@ -612,19 +598,15 @@ async def get_trending_from_db(limit: int = 5, hours: int = 6) -> tuple[List[Dic
             if results:
                 try:
                     # Fetch history for these threads
-                    placeholders = ','.join('?' for _ in thread_ids)
-                    history_query = f'''
+                    history_query = '''
                         SELECT thread_id, replies, captured_at 
                         FROM colibot_thread_snapshots 
-                        WHERE thread_id IN ({placeholders}) 
-                        AND captured_at > datetime('now', '-' || ? || ' hours')
+                        WHERE thread_id = ANY($1::text[]) 
+                        AND captured_at > NOW() - ($2 || ' hours')::INTERVAL
                         ORDER BY captured_at ASC
                     '''
-                    params = list(thread_ids)
-                    params.append(str(hours))
                     
-                    async with db.execute(history_query, params) as cursor:
-                        history_rows = await cursor.fetchall()
+                    history_rows = await conn.fetch(history_query, thread_ids, str(hours))
                         
                     # Organize data for chart
                     chart_data = {} # {title: [(time, replies), ...]}
@@ -633,9 +615,9 @@ async def get_trending_from_db(limit: int = 5, hours: int = 6) -> tuple[List[Dic
                     id_to_title = {t['id']: t['title'] for t in results}
                     
                     for h_row in history_rows:
-                        tid = h_row[0] # thread_id
-                        replies = h_row[1]
-                        captured_at = datetime.fromisoformat(h_row[2])
+                        tid = h_row['thread_id']
+                        replies = h_row['replies']
+                        captured_at = h_row['captured_at'] # Already a datetime object in asyncpg
                         
                         if tid in id_to_title:
                             title = id_to_title[tid]
@@ -684,22 +666,24 @@ async def scheduled_scraper():
 @tasks.loop(hours=24)
 async def cleanup_old_data():
     """Delete snapshots older than 7 days to keep DB size manageable"""
+    if not pool:
+        return
+
     try:
         logger.info("Starting daily data cleanup...")
-        async with aiosqlite.connect(db_path) as db:
+        async with pool.acquire() as conn:
             # Delete old snapshots
-            await db.execute('''
+            await conn.execute('''
                 DELETE FROM colibot_thread_snapshots 
-                WHERE captured_at < datetime('now', '-7 days')
+                WHERE captured_at < NOW() - INTERVAL '7 days'
             ''')
             
             # Optional: Delete threads that haven't been updated in 30 days
-            await db.execute('''
+            await conn.execute('''
                 DELETE FROM colibot_threads
-                WHERE updated_at < datetime('now', '-30 days')
+                WHERE updated_at < NOW() - INTERVAL '30 days'
             ''')
             
-            await db.commit()
             logger.info("Cleanup complete")
             
     except Exception as e:

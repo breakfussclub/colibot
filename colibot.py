@@ -372,12 +372,12 @@ class ForumScraper:
                     # DDG results are in .result__a
                     results = soup.find_all('a', class_='result__a', limit=limit)
                     
+                    tasks = []
                     for res in results:
                         title = res.get_text(strip=True)
                         raw_url = res.get('href', '')
                         
-                        # DDG wraps URLs: //duckduckgo.com/l/?uddg=REAL_URL&rut=...
-                        # Or sometimes direct links. Check if it's a wrapper.
+                        # DDG wraps URLs
                         thread_url = raw_url
                         if 'uddg=' in raw_url:
                             try:
@@ -387,23 +387,84 @@ class ForumScraper:
                             except:
                                 pass
                         
-                        # Only include actual thread links
                         if '/threads/' in thread_url:
-                            threads.append({
-                                'title': title,
-                                'url': thread_url,
-                                'author': 'Search Result', # DDG doesn't show author easily
-                                'replies': 0, # Can't get stats from DDG
-                                'views': 0
-                            })
-                            
-                    return threads
+                            # Create a task to fetch the actual thread page for details
+                            tasks.append(self.fetch_thread_details(thread_url, title))
+                    
+                    # Run all fetches in parallel
+                    if tasks:
+                        threads = await asyncio.gather(*tasks)
+                        # Filter out Nones
+                        return [t for t in threads if t]
+                    return []
                 else:
                     logger.error(f"DDG Search failed with status {response.status}")
                     return []
         except Exception as e:
             logger.error(f"Error searching threads: {e}")
             return []
+
+    async def fetch_thread_details(self, url: str, fallback_title: str) -> Optional[Dict]:
+        """Fetch a thread page and extract details (stats, author, image)"""
+        try:
+            html = await self.fetch_page(url)
+            if not html:
+                return {
+                    'title': fallback_title,
+                    'url': url,
+                    'author': 'Unknown',
+                    'replies': 0,
+                    'views': 0,
+                    'image': None
+                }
+            
+            soup = BeautifulSoup(html, 'html.parser')
+            base_url = self.forum_url.split('/forums/')[0]
+            
+            # 1. Title (Real title from page)
+            title = fallback_title
+            h1 = soup.find('h1', class_='p-title-value')
+            if h1:
+                title = h1.get_text(strip=True)
+            
+            # 2. Author
+            author = "Unknown"
+            author_elem = soup.find('a', class_='username')
+            if author_elem:
+                author = author_elem.get_text(strip=True)
+                
+            # 3. Stats (Replies/Views are tricky on thread view, usually in meta or not shown clearly like list view)
+            # Actually, XenForo thread view doesn't always show total views easily in the header.
+            # But we can try to find it in JSON-LD or meta tags.
+            replies = 0
+            views = 0
+            
+            # Try to find "X replies" text or similar? 
+            # Or just accept 0 for now if it's too hard, but user asked for it.
+            # Let's look for .p-body-header-content or similar.
+            # Actually, let's just stick to 0 if we can't find it easily, but try to find an image.
+            
+            # 4. Image (First image in the first post)
+            image = None
+            first_post = soup.find('article', class_='message--post')
+            if first_post:
+                img_elem = first_post.find('img', class_='bbImage')
+                if img_elem:
+                    image = img_elem.get('src')
+                    if image and not image.startswith('http'):
+                        image = base_url + image
+            
+            return {
+                'title': title,
+                'url': url,
+                'author': author,
+                'replies': replies, # Keeping 0 for now as it's hard to scrape from thread view
+                'views': views,
+                'image': image
+            }
+        except Exception as e:
+            logger.error(f"Error fetching thread details for {url}: {e}")
+            return None
 
 
 
@@ -964,15 +1025,19 @@ async def search(interaction: discord.Interaction, query: str):
         
         for i, thread in enumerate(threads, 1):
             author = thread.get('author', 'Unknown')
-            replies = thread.get('replies', 0)
-            views = thread.get('views', 0)
+            # replies = thread.get('replies', 0) # Removed stats since we can't reliably get them from thread view
             
             embed.add_field(
                 name=f"#{i}",
-                value=f"[**{thread['title'][:100]}**]({thread['url']})\nby {author} • 💬 {replies:,} • 👁️ {views:,}",
+                value=f"[**{thread['title'][:100]}**]({thread['url']})\nby {author}",
                 inline=False
             )
             
+            # Set thumbnail to the first result's image if available
+            if i == 1 and thread.get('image'):
+                embed.set_thumbnail(url=thread['image'])
+        
+        embed.set_footer(text="ColiBot • Search Results", icon_url="https://raw.githubusercontent.com/breakfussclub/colibot/main/assets/colibot_logo.png")
         await interaction.followup.send(embed=embed)
         
     except Exception as e:

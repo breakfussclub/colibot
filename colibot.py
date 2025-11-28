@@ -523,77 +523,10 @@ def generate_chart_url(data: Dict[str, List[tuple]]) -> str:
         labels = [t.strftime('%H:%M') for t in sorted_times]
         
         for i, (title, points) in enumerate(data.items()):
-            # Map points to the common time axis
-            point_map = {t: r for t, r in points}
-            data_points = []
-            last_val = 0
-            
-            for t in sorted_times:
-                if t in point_map:
-                    last_val = point_map[t]
-                    data_points.append(last_val)
-                else:
-                    # Fill gaps with last known value or None
-                    data_points.append(last_val if last_val > 0 else None)
-            
-            datasets.append({
-                'label': title[:20] + '...',
-                'data': data_points,
-                'borderColor': colors[i % len(colors)],
-                'fill': False,
-                'borderWidth': 2,
-                'pointRadius': 0
-            })
-            
-        config = {
-            'type': 'line',
-            'data': {
-                'labels': labels,
-                'datasets': datasets
-            },
-            'options': {
-                'title': {
-                    'display': True,
-                    'text': 'Reply Growth (Last 6 Hours)',
-                    'fontColor': '#fff'
-                },
-                'legend': {
-                    'position': 'bottom',
-                    'labels': {
-                        'fontColor': '#fff',
-                        'fontSize': 10
-                    }
-                },
-                'scales': {
-                    'xAxes': [{
-                        'ticks': {'fontColor': '#ccc'}
-                    }],
-                    'yAxes': [{
-                        'ticks': {'fontColor': '#ccc'}
-                    }]
-                }
-            }
-        }
-        
-        # QuickChart URL
-        base = "https://quickchart.io/chart"
-        params = {
-            'c': json.dumps(config),
-            'w': 500,
-            'h': 300,
-            'bkg': '#2f3136' # Discord dark mode background
-        }
-        return f"{base}?{urllib.parse.urlencode(params)}"
-        
-    except Exception as e:
-        logger.error(f"Error generating chart: {e}")
-        return None
-
-
-async def get_trending_from_db(limit: int = 5, hours: int = 6) -> tuple[List[Dict], Optional[str]]:
+async def get_trending_from_db(limit: int = 5, hours: int = 6) -> List[Dict]:
     """Get trending threads based on velocity (growth) from DB"""
     if not pool:
-        return [], None
+        return []
 
     try:
         async with pool.acquire() as conn:
@@ -636,7 +569,6 @@ async def get_trending_from_db(limit: int = 5, hours: int = 6) -> tuple[List[Dic
             rows = await conn.fetch(query, str(hours), str(hours), str(hours), limit)
             
             results = []
-            thread_ids = []
             
             for row in rows:
                 # Format growth display with K/M if needed
@@ -659,7 +591,7 @@ async def get_trending_from_db(limit: int = 5, hours: int = 6) -> tuple[List[Dic
                     growth_display = f"{heat_emoji} +{reply_growth} replies in last {hours}h"
                 
                 results.append({
-                    'id': row['thread_id'], # Needed for chart history
+                    'id': row['thread_id'], 
                     'title': row['title'],
                     'url': row['url'],
                     'author': row['author'],
@@ -669,51 +601,12 @@ async def get_trending_from_db(limit: int = 5, hours: int = 6) -> tuple[List[Dic
                     'growth_display': growth_display,
                     'heat_emoji': heat_emoji
                 })
-                thread_ids.append(row['thread_id'])
             
-            # Generate Chart
-            chart_url = None
-            if results:
-                try:
-                    # Fetch history for these threads
-                    history_query = '''
-                        SELECT thread_id, replies, captured_at 
-                        FROM colibot_thread_snapshots 
-                        WHERE thread_id = ANY($1::text[]) 
-                        AND captured_at > NOW() - ($2 || ' hours')::INTERVAL
-                        ORDER BY captured_at ASC
-                    '''
-                    
-                    history_rows = await conn.fetch(history_query, thread_ids, str(hours))
-                        
-                    # Organize data for chart
-                    chart_data = {} # {title: [(time, replies), ...]}
-                    
-                    # Map IDs to titles
-                    id_to_title = {t['id']: t['title'] for t in results}
-                    
-                    for h_row in history_rows:
-                        tid = h_row['thread_id']
-                        replies = h_row['replies']
-                        captured_at = h_row['captured_at'] # Already a datetime object in asyncpg
-                        
-                        if tid in id_to_title:
-                            title = id_to_title[tid]
-                            if title not in chart_data:
-                                chart_data[title] = []
-                            chart_data[title].append((captured_at, replies))
-                            
-                    if chart_data:
-                        chart_url = generate_chart_url(chart_data)
-                        
-                except Exception as e:
-                    logger.error(f"Error fetching history for chart: {e}")
-            
-            return results, chart_url
+            return results
             
     except Exception as e:
         logger.error(f"Error fetching trending from DB: {e}")
-        return [], None
+        return []
 
 
 @tasks.loop(minutes=30)
@@ -766,7 +659,7 @@ async def cleanup_old_data():
             
     except Exception as e:
         logger.error(f"Error in cleanup_old_data: {e}")
-def create_trending_embed(threads: List[Dict], forum_name: str, hours: int, chart_url: str = None) -> discord.Embed:
+def create_trending_embed(threads: List[Dict], forum_name: str, hours: int) -> discord.Embed:
     """Create Discord embed for trending threads"""
     embed = discord.Embed(
         title="🔥 Trending Threads",
@@ -801,9 +694,6 @@ def create_trending_embed(threads: List[Dict], forum_name: str, hours: int, char
     
     embed.set_footer(text="ColiBot • Trending Threads", icon_url="https://raw.githubusercontent.com/breakfussclub/colibot/main/assets/colibot_logo.png")
     
-    if chart_url:
-        embed.set_image(url=chart_url)
-        
     return embed
 
 
@@ -880,7 +770,7 @@ async def scheduled_posts():
         for forum_url in FORUM_URLS:
             try:
                 # Try to get from DB first
-                threads, chart_url = await get_trending_from_db(5, TIME_FILTER_HOURS)
+                threads = await get_trending_from_db(5, TIME_FILTER_HOURS)
                 
                 # Fallback if DB returns nothing (e.g. first run)
                 if not threads:
@@ -890,7 +780,7 @@ async def scheduled_posts():
                     await scraper.close_session()
                 
                 forum_name = forum_url.split('/')[-2].replace('-', ' ').title()
-                embed = create_trending_embed(threads, forum_name, TIME_FILTER_HOURS, chart_url)
+                embed = create_trending_embed(threads, forum_name, TIME_FILTER_HOURS)
                 await channel.send(embed=embed)
                 
                 await asyncio.sleep(2)
@@ -927,7 +817,7 @@ async def force_trending(interaction: discord.Interaction):
     for forum_url in FORUM_URLS:
         try:
             # Try to get from DB first
-            threads, chart_url = await get_trending_from_db(5, TIME_FILTER_HOURS)
+            threads = await get_trending_from_db(5, TIME_FILTER_HOURS)
             
             # Fallback
             if not threads:
@@ -936,7 +826,7 @@ async def force_trending(interaction: discord.Interaction):
                 await scraper.close_session()
             
             forum_name = forum_url.split('/')[-2].replace('-', ' ').title()
-            embed = create_trending_embed(threads, forum_name, TIME_FILTER_HOURS, chart_url)
+            embed = create_trending_embed(threads, forum_name, TIME_FILTER_HOURS)
             await interaction.followup.send(embed=embed)
             
             await asyncio.sleep(2)

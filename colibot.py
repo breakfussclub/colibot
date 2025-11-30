@@ -29,6 +29,7 @@ NEWEST_POST_TIME = os.getenv('NEWEST_POST_TIME', '18:00')
 POST_INTERVAL_HOURS = int(os.getenv('POST_INTERVAL_HOURS', '3'))  # Default every 3 hours
 FORUM_URLS = os.getenv('FORUM_URLS', 'https://www.thecoli.com/forums/the-locker-room.6/').split(',')
 TIME_FILTER_HOURS = int(os.getenv('TIME_FILTER_HOURS', '6'))  # Default 6 hours
+BOT_STATUS = os.getenv('BOT_STATUS', 'The Coli')
 # Global DB Connection
 DATABASE_URL = os.getenv('DATABASE_URL')
 pool = None
@@ -709,6 +710,8 @@ def create_newest_embed(threads: List[Dict], forum_name: str, hours: int) -> dis
 @bot.event
 async def on_ready():
     logger.info(f'{bot.user} has connected to Discord!')
+    await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.watching, name=BOT_STATUS))
+    logger.info(f'Set bot status to: Watching {BOT_STATUS}')
     logger.info(f'Trending posts interval: Every {POST_INTERVAL_HOURS} hours')
     logger.info(f'Newest posts scheduled for: {NEWEST_POST_TIME}')
     logger.info(f'Time filter: Last {TIME_FILTER_HOURS} hours')

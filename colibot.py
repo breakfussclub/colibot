@@ -792,7 +792,7 @@ async def scheduled_posts():
     description="Manually post the top 5 trending threads from the last 6 hours",
     guild=discord.Object(id=GUILD_ID)
 )
-async def force_trending(interaction: discord.Interaction):
+async def force_trending(interaction: discord.Interaction, channel: discord.TextChannel = None):
     """Force post trending threads"""
     await interaction.response.defer()
     
@@ -809,7 +809,12 @@ async def force_trending(interaction: discord.Interaction):
             
             forum_name = forum_url.split('/')[-2].replace('-', ' ').title()
             embed = create_trending_embed(threads, forum_name, TIME_FILTER_HOURS)
-            await interaction.followup.send(embed=embed)
+            
+            if channel:
+                await channel.send(embed=embed)
+                await interaction.followup.send(f"✅ Posted trending threads to {channel.mention}")
+            else:
+                await interaction.followup.send(embed=embed)
             
             await asyncio.sleep(2)
         except Exception as e:

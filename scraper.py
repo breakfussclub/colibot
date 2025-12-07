@@ -2,7 +2,7 @@ import aiohttp
 from bs4 import BeautifulSoup
 import re
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import asyncio
 from typing import List, Dict, Optional
 import urllib.parse
@@ -13,6 +13,16 @@ class ForumScraper:
     def __init__(self, forum_url: str):
         self.forum_url = forum_url.strip()
         self.session = None
+        self._last_request_time = None
+        self._min_request_interval = 2  # seconds between requests
+    
+    async def _respect_rate_limit(self):
+        """Ensure minimum time between requests for politeness"""
+        if self._last_request_time:
+            elapsed = (datetime.now() - self._last_request_time).total_seconds()
+            if elapsed < self._min_request_interval:
+                await asyncio.sleep(self._min_request_interval - elapsed)
+        self._last_request_time = datetime.now()
     
     async def init_session(self):
         if not self.session:
@@ -33,6 +43,7 @@ class ForumScraper:
     async def close_session(self):
         if self.session:
             await self.session.close()
+            self.session = None
     
     def parse_number(self, text: str) -> int:
         """Parse number strings with K/M suffixes"""
@@ -56,6 +67,8 @@ class ForumScraper:
 
     async def fetch_page(self, url: str) -> str:
         await self.init_session()
+        await self._respect_rate_limit()  # Rate limiting
+        
         for attempt in range(3):
             try:
                 async with self.session.get(url, timeout=30) as response:
@@ -73,8 +86,15 @@ class ForumScraper:
                 if attempt < 2:
                     await asyncio.sleep(2 ** attempt)
                 else:
+                    await self.close_session()  # Cleanup on final failure
                     return None
         return None
+    
+    def make_aware(self, dt):
+        """Ensure datetime is timezone-aware (UTC)"""
+        if dt and dt.tzinfo is None:
+            return dt.replace(tzinfo=timezone.utc)
+        return dt
     
     def parse_thread_element(self, element, base_url: str) -> Dict:
         """Parse a single thread element and extract all data"""
@@ -191,7 +211,7 @@ class ForumScraper:
         base_url = self.forum_url.split('/forums/')[0]
         
         threads = []
-        cutoff_time = datetime.now(datetime.now().astimezone().tzinfo) - timedelta(hours=hours)
+        cutoff_time = self.make_aware(datetime.now() - timedelta(hours=hours))
         
         # Get all thread elements - get more to account for filtering
         # Fetch up to 50 threads to find the best ones
@@ -205,17 +225,13 @@ class ForumScraper:
             if thread_data:
                 # Filter by last post time if we have a timestamp
                 if thread_data.get('last_post_at'):
-                    # Make cutoff_time timezone-aware if thread timestamp is
-                    if thread_data['last_post_at'].tzinfo is not None and cutoff_time.tzinfo is None:
-                        cutoff_time = cutoff_time.replace(tzinfo=thread_data['last_post_at'].tzinfo)
+                    thread_time = self.make_aware(thread_data['last_post_at'])
                     
-                    if thread_data['last_post_at'] >= cutoff_time:
+                    if thread_time >= cutoff_time:
                         threads.append(thread_data)
                         logger.debug(f"Added trending thread candidate: {thread_data['title'][:50]}")
                     else:
-                        # Since we are ordered by last post date, we can stop here
                         logger.debug(f"Thread too old (last post): {thread_data['title'][:50]}")
-                        # break  # Uncommenting break for efficiency since we are sorted by last post
                 else:
                     # If no timestamp, include it (might be recent)
                     threads.append(thread_data)
@@ -240,7 +256,7 @@ class ForumScraper:
         base_url = self.forum_url.split('/forums/')[0]
         
         threads = []
-        cutoff_time = datetime.now(datetime.now().astimezone().tzinfo) - timedelta(hours=hours)
+        cutoff_time = self.make_aware(datetime.now() - timedelta(hours=hours))
         
         # Get thread elements
         thread_elements = soup.find_all('div', class_='structItem--thread', limit=limit * 3)
@@ -253,11 +269,9 @@ class ForumScraper:
             if thread_data:
                 # Filter by creation time if available
                 if thread_data['created_at']:
-                    # Make cutoff_time timezone-aware if thread timestamp is
-                    if thread_data['created_at'].tzinfo is not None and cutoff_time.tzinfo is None:
-                        cutoff_time = cutoff_time.replace(tzinfo=thread_data['created_at'].tzinfo)
+                    thread_time = self.make_aware(thread_data['created_at'])
                     
-                    if thread_data['created_at'] >= cutoff_time:
+                    if thread_time >= cutoff_time:
                         threads.append(thread_data)
                         logger.debug(f"Added new thread: {thread_data['title'][:50]}")
                     else:
@@ -291,6 +305,8 @@ class ForumScraper:
             }
             
             await self.init_session()
+            await self._respect_rate_limit()  # Rate limiting for search too
+            
             async with self.session.post(search_url, data=params, headers=headers) as response:
                 if response.status == 200:
                     html = await response.text()

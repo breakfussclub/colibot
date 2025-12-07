@@ -21,6 +21,14 @@ class ForumScraper:
                     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
                 }
             )
+        return self
+
+    async def __aenter__(self):
+        await self.init_session()
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        await self.close_session()
     
     async def close_session(self):
         if self.session:

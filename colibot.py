@@ -9,7 +9,8 @@ import re
 from bs4 import BeautifulSoup
 
 # Import new modules
-from database import init_db, save_thread_snapshot, get_trending_from_db, cleanup_old_data
+from config import Config
+from database import init_db, save_thread_snapshot, get_trending_from_db, cleanup_old_data, close_db
 from scraper import ForumScraper
 from utils import create_trending_embed, create_newest_embed
 
@@ -20,16 +21,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger('ColiBot')
 
-# Environment variables
-DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
-CHANNEL_ID = int(os.getenv('CHANNEL_ID'))
-GUILD_ID = int(os.getenv('GUILD_ID'))
-POPULAR_POST_TIME = os.getenv('POPULAR_POST_TIME', '09:00')
-NEWEST_POST_TIME = os.getenv('NEWEST_POST_TIME', '18:00')
-POST_INTERVAL_HOURS = int(os.getenv('POST_INTERVAL_HOURS', '3'))  # Default every 3 hours
-FORUM_URLS = os.getenv('FORUM_URLS', 'https://www.thecoli.com/forums/the-locker-room.6/').split(',')
-TIME_FILTER_HOURS = int(os.getenv('TIME_FILTER_HOURS', '6'))  # Default 6 hours
-BOT_STATUS = os.getenv('BOT_STATUS', 'The Coli')
+# Validate config
+try:
+    Config.validate()
+except ValueError as e:
+    logger.error(str(e))
+    exit(1)
 
 # Bot setup
 intents = discord.Intents.default()
@@ -42,13 +39,12 @@ tree = app_commands.CommandTree(bot)
 async def scheduled_scraper():
     """Background task to scrape threads and save snapshots"""
     logger.info("Starting scheduled scrape for snapshots...")
-    for forum_url in FORUM_URLS:
+    for forum_url in Config.FORUM_URLS:
         try:
-            scraper = ForumScraper(forum_url)
-            # Fetch trending (active) threads to capture activity
-            # We fetch a larger number to ensure we catch active threads from the last 24h
-            threads = await scraper.get_trending_threads(limit=40, hours=24)
-            await scraper.close_session()
+            async with ForumScraper(forum_url) as scraper:
+                # Fetch trending (active) threads to capture activity
+                # We fetch a larger number to ensure we catch active threads from the last 24h
+                threads = await scraper.get_trending_threads(limit=40, hours=24)
             
             count = 0
             for thread in threads:
@@ -66,18 +62,18 @@ async def scheduled_scraper():
 @bot.event
 async def on_ready():
     logger.info(f'{bot.user} has connected to Discord!')
-    await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.watching, name=BOT_STATUS))
-    logger.info(f'Set bot status to: Watching {BOT_STATUS}')
-    logger.info(f'Trending posts interval: Every {POST_INTERVAL_HOURS} hours')
-    logger.info(f'Newest posts scheduled for: {NEWEST_POST_TIME}')
-    logger.info(f'Time filter: Last {TIME_FILTER_HOURS} hours')
-    logger.info(f'Monitoring forums: {FORUM_URLS}')
+    await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.watching, name=Config.BOT_STATUS))
+    logger.info(f'Set bot status to: Watching {Config.BOT_STATUS}')
+    logger.info(f'Trending posts interval: Every {Config.POST_INTERVAL_HOURS} hours')
+    logger.info(f'Newest posts scheduled for: {Config.NEWEST_POST_TIME}')
+    logger.info(f'Time filter: Last {Config.TIME_FILTER_HOURS} hours')
+    logger.info(f'Monitoring forums: {Config.FORUM_URLS}')
     
     # Sync slash commands to the guild
-    guild = discord.Object(id=GUILD_ID)
+    guild = discord.Object(id=Config.GUILD_ID)
     tree.copy_global_to(guild=guild)
     await tree.sync(guild=guild)
-    logger.info(f'Slash commands synced to guild {GUILD_ID}')
+    logger.info(f'Slash commands synced to guild {Config.GUILD_ID}')
     
     if not scheduled_posts.is_running():
         scheduled_posts.start()
@@ -89,36 +85,41 @@ async def on_ready():
     if not cleanup_old_data.is_running():
         cleanup_old_data.start()
 
+@bot.event
+async def close():
+    """Graceful shutdown"""
+    logger.info("Shutting down...")
+    await close_db()
+    await super().close()
 
 @tasks.loop(minutes=1)
 async def scheduled_posts():
     """Check every minute if it's time to post"""
     now = datetime.now().strftime('%H:%M')
-    channel = bot.get_channel(CHANNEL_ID)
+    channel = bot.get_channel(Config.CHANNEL_ID)
     
     if not channel:
-        logger.error(f"Channel {CHANNEL_ID} not found")
+        logger.error(f"Channel {Config.CHANNEL_ID} not found")
         return
     
     # Post trending threads - Check if we hit the interval hour
     # We check if minute is 0 and hour is divisible by interval
     now_dt = datetime.now()
-    if now_dt.minute == 0 and now_dt.hour % POST_INTERVAL_HOURS == 0:
+    if now_dt.minute == 0 and now_dt.hour % Config.POST_INTERVAL_HOURS == 0:
         logger.info("Posting trending threads...")
-        for forum_url in FORUM_URLS:
+        for forum_url in Config.FORUM_URLS:
             try:
                 # Try to get from DB first
-                threads = await get_trending_from_db(5, TIME_FILTER_HOURS)
+                threads = await get_trending_from_db(5, Config.TIME_FILTER_HOURS)
                 
                 # Fallback if DB returns nothing (e.g. first run)
                 if not threads:
                     logger.info("No DB stats yet, falling back to scraper")
-                    scraper = ForumScraper(forum_url)
-                    threads = await scraper.get_trending_threads(5, TIME_FILTER_HOURS)
-                    await scraper.close_session()
+                    async with ForumScraper(forum_url) as scraper:
+                        threads = await scraper.get_trending_threads(5, Config.TIME_FILTER_HOURS)
                 
                 forum_name = forum_url.split('/')[-2].replace('-', ' ').title()
-                embed = create_trending_embed(threads, forum_name, TIME_FILTER_HOURS)
+                embed = create_trending_embed(threads, forum_name, Config.TIME_FILTER_HOURS)
                 await channel.send(embed=embed)
                 
                 await asyncio.sleep(2)
@@ -126,16 +127,15 @@ async def scheduled_posts():
                 logger.error(f"Error posting trending threads for {forum_url}: {e}")
     
     # Post newest threads
-    elif now == NEWEST_POST_TIME:
+    elif now == Config.NEWEST_POST_TIME:
         logger.info("Posting newest threads...")
-        for forum_url in FORUM_URLS:
+        for forum_url in Config.FORUM_URLS:
             try:
-                scraper = ForumScraper(forum_url)
-                threads = await scraper.get_newest_threads(5, TIME_FILTER_HOURS)
-                await scraper.close_session()
+                async with ForumScraper(forum_url) as scraper:
+                    threads = await scraper.get_newest_threads(5, Config.TIME_FILTER_HOURS)
                 
                 forum_name = forum_url.split('/')[-2].replace('-', ' ').title()
-                embed = create_newest_embed(threads, forum_name, TIME_FILTER_HOURS)
+                embed = create_newest_embed(threads, forum_name, Config.TIME_FILTER_HOURS)
                 await channel.send(embed=embed)
                 
                 await asyncio.sleep(2)
@@ -146,25 +146,24 @@ async def scheduled_posts():
 @tree.command(
     name="force_trending",
     description="Manually post the top 5 trending threads from the last 6 hours",
-    guild=discord.Object(id=GUILD_ID)
+    guild=discord.Object(id=Config.GUILD_ID)
 )
 async def force_trending(interaction: discord.Interaction, channel: discord.TextChannel = None):
     """Force post trending threads"""
     await interaction.response.defer()
     
-    for forum_url in FORUM_URLS:
+    for forum_url in Config.FORUM_URLS:
         try:
             # Try to get from DB first
-            threads = await get_trending_from_db(5, TIME_FILTER_HOURS)
+            threads = await get_trending_from_db(5, Config.TIME_FILTER_HOURS)
             
             # Fallback
             if not threads:
-                scraper = ForumScraper(forum_url)
-                threads = await scraper.get_trending_threads(5, TIME_FILTER_HOURS)
-                await scraper.close_session()
+                async with ForumScraper(forum_url) as scraper:
+                    threads = await scraper.get_trending_threads(5, Config.TIME_FILTER_HOURS)
             
             forum_name = forum_url.split('/')[-2].replace('-', ' ').title()
-            embed = create_trending_embed(threads, forum_name, TIME_FILTER_HOURS)
+            embed = create_trending_embed(threads, forum_name, Config.TIME_FILTER_HOURS)
             
             if channel:
                 await channel.send(embed=embed)
@@ -181,20 +180,19 @@ async def force_trending(interaction: discord.Interaction, channel: discord.Text
 @tree.command(
     name="force_new",
     description="Manually post the 5 newest threads from the last 6 hours",
-    guild=discord.Object(id=GUILD_ID)
+    guild=discord.Object(id=Config.GUILD_ID)
 )
 async def force_new(interaction: discord.Interaction):
     """Force post newest threads"""
     await interaction.response.defer()
     
-    for forum_url in FORUM_URLS:
+    for forum_url in Config.FORUM_URLS:
         try:
-            scraper = ForumScraper(forum_url)
-            threads = await scraper.get_newest_threads(5, TIME_FILTER_HOURS)
-            await scraper.close_session()
+            async with ForumScraper(forum_url) as scraper:
+                threads = await scraper.get_newest_threads(5, Config.TIME_FILTER_HOURS)
             
             forum_name = forum_url.split('/')[-2].replace('-', ' ').title()
-            embed = create_newest_embed(threads, forum_name, TIME_FILTER_HOURS)
+            embed = create_newest_embed(threads, forum_name, Config.TIME_FILTER_HOURS)
             await interaction.followup.send(embed=embed)
             
             await asyncio.sleep(2)
@@ -206,7 +204,7 @@ async def force_new(interaction: discord.Interaction):
 @tree.command(
     name="status",
     description="Check ColiBot's configuration and status",
-    guild=discord.Object(id=GUILD_ID)
+    guild=discord.Object(id=Config.GUILD_ID)
 )
 async def status(interaction: discord.Interaction):
     """Check bot status and configuration"""
@@ -215,11 +213,11 @@ async def status(interaction: discord.Interaction):
         color=discord.Color.blue(),
         timestamp=datetime.utcnow()
     )
-    embed.add_field(name="Trending Posts Interval", value=f"Every {POST_INTERVAL_HOURS} hours", inline=False)
-    embed.add_field(name="Newest Posts Time", value=NEWEST_POST_TIME, inline=False)
-    embed.add_field(name="Time Filter", value=f"Last {TIME_FILTER_HOURS} hours", inline=False)
-    embed.add_field(name="Monitored Forums", value='\n'.join(FORUM_URLS), inline=False)
-    embed.add_field(name="Target Channel", value=f"<#{CHANNEL_ID}>", inline=False)
+    embed.add_field(name="Trending Posts Interval", value=f"Every {Config.POST_INTERVAL_HOURS} hours", inline=False)
+    embed.add_field(name="Newest Posts Time", value=Config.NEWEST_POST_TIME, inline=False)
+    embed.add_field(name="Time Filter", value=f"Last {Config.TIME_FILTER_HOURS} hours", inline=False)
+    embed.add_field(name="Monitored Forums", value='\n'.join(Config.FORUM_URLS), inline=False)
+    embed.add_field(name="Target Channel", value=f"<#{Config.CHANNEL_ID}>", inline=False)
     embed.set_footer(text="ColiBot")
     await interaction.response.send_message(embed=embed)
 
@@ -227,7 +225,7 @@ async def status(interaction: discord.Interaction):
 @tree.command(
     name="search",
     description="Search for threads on The Coli",
-    guild=discord.Object(id=GUILD_ID)
+    guild=discord.Object(id=Config.GUILD_ID)
 )
 async def search(interaction: discord.Interaction, query: str):
     """Search for threads"""
@@ -235,9 +233,8 @@ async def search(interaction: discord.Interaction, query: str):
     
     try:
         # Use the first configured forum URL to get the base domain
-        scraper = ForumScraper(FORUM_URLS[0])
-        threads = await scraper.search_threads(query, limit=5)
-        await scraper.close_session()
+        async with ForumScraper(Config.FORUM_URLS[0]) as scraper:
+            threads = await scraper.search_threads(query, limit=5)
         
         if not threads:
             await interaction.followup.send(f"No results found for '{query}'.")
@@ -284,8 +281,8 @@ async def on_message(message):
             
             for url in urls[:1]: # Only unfurl the first link to avoid spam
                 # Scrape the thread details
-                scraper = ForumScraper(url) # URL doesn't matter much here, we just need the instance
-                html = await scraper.fetch_page(url)
+                async with ForumScraper(url) as scraper: # URL doesn't matter much here, we just need the instance
+                    html = await scraper.fetch_page(url)
                 
                 if html:
                     soup = BeautifulSoup(html, 'html.parser')
@@ -314,21 +311,13 @@ async def on_message(message):
                         
                         await message.channel.send(embed=embed)
                         
-                await scraper.close_session()
-                
         except Exception as e:
             logger.error(f"Error unfurling link: {e}")
 
 
 if __name__ == "__main__":
-    if not DISCORD_TOKEN:
+    if not Config.DISCORD_TOKEN:
         logger.error("DISCORD_TOKEN environment variable not set!")
         exit(1)
-    if not CHANNEL_ID:
-        logger.error("CHANNEL_ID environment variable not set!")
-        exit(1)
-    if not GUILD_ID:
-        logger.error("GUILD_ID environment variable not set!")
-        exit(1)
     
-    bot.run(DISCORD_TOKEN)
+    bot.run(Config.DISCORD_TOKEN)

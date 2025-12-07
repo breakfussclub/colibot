@@ -7,19 +7,23 @@ from typing import List, Dict, Optional
 # Configure logging
 logger = logging.getLogger('ColiBot')
 
+from config import Config
+
+# Configure logging
+logger = logging.getLogger('ColiBot')
+
 # Global DB Connection
-DATABASE_URL = os.getenv('DATABASE_URL')
 pool = None
 
 async def init_db():
     """Initialize PostgreSQL database pool and schema"""
     global pool
     try:
-        if not DATABASE_URL:
+        if not Config.DATABASE_URL:
             logger.error("DATABASE_URL not set!")
             return
 
-        pool = await asyncpg.create_pool(DATABASE_URL)
+        pool = await asyncpg.create_pool(Config.DATABASE_URL)
         
         async with pool.acquire() as conn:
             # Create threads table
@@ -203,3 +207,10 @@ async def cleanup_old_data():
             
     except Exception as e:
         logger.error(f"Error in cleanup_old_data: {e}")
+
+async def close_db():
+    """Close the database connection pool"""
+    global pool
+    if pool:
+        await pool.close()
+        logger.info("Database connection pool closed")

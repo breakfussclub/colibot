@@ -3,17 +3,22 @@ import logging
 import asyncpg
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional
+from discord.ext import tasks
 
 # Configure logging
 logger = logging.getLogger('ColiBot')
 
 from config import Config
 
-# Configure logging
-logger = logging.getLogger('ColiBot')
-
 # Global DB Connection
 pool = None
+
+async def ensure_pool():
+    """Ensure database pool is healthy and initialized"""
+    global pool
+    if pool is None:
+        await init_db()
+    return pool
 
 async def init_db():
     """Initialize PostgreSQL database pool and schema"""
@@ -63,11 +68,16 @@ async def init_db():
 
 async def save_thread_snapshot(thread_data: Dict):
     """Save thread data and snapshot to database"""
-    if not thread_data.get('id') or not pool:
+    if not thread_data.get('id'):
         return
 
     try:
-        async with pool.acquire() as conn:
+        current_pool = await ensure_pool()
+        if not current_pool:
+            logger.error("Database pool not available")
+            return
+            
+        async with current_pool.acquire() as conn:
             # Check if the latest snapshot is identical to current data
             latest = await conn.fetchrow('''
                 SELECT replies, views FROM colibot_thread_snapshots 
@@ -100,11 +110,13 @@ async def save_thread_snapshot(thread_data: Dict):
 
 async def get_trending_from_db(limit: int = 5, hours: int = 6) -> List[Dict]:
     """Get trending threads based on velocity (growth) from DB"""
-    if not pool:
-        return []
-
     try:
-        async with pool.acquire() as conn:
+        current_pool = await ensure_pool()
+        if not current_pool:
+            logger.error("Database pool not available")
+            return []
+            
+        async with current_pool.acquire() as conn:
             # Postgres version using DISTINCT ON for cleaner logic
             
             query = '''
@@ -185,32 +197,40 @@ async def get_trending_from_db(limit: int = 5, hours: int = 6) -> List[Dict]:
 
 async def cleanup_old_data():
     """Delete snapshots older than 7 days to keep DB size manageable"""
-    if not pool:
-        return
-
     try:
+        current_pool = await ensure_pool()
+        if not current_pool:
+            logger.error("Database pool not available for cleanup")
+            return
+            
         logger.info("Starting daily data cleanup...")
-        async with pool.acquire() as conn:
+        async with current_pool.acquire() as conn:
             # Delete old snapshots
-            await conn.execute('''
+            deleted_snapshots = await conn.execute('''
                 DELETE FROM colibot_thread_snapshots 
                 WHERE captured_at < NOW() - INTERVAL '7 days'
             ''')
             
             # Optional: Delete threads that haven't been updated in 30 days
-            await conn.execute('''
+            deleted_threads = await conn.execute('''
                 DELETE FROM colibot_threads
                 WHERE updated_at < NOW() - INTERVAL '30 days'
             ''')
             
-            logger.info("Cleanup complete")
+            logger.info(f"Cleanup complete - Removed old snapshots and threads")
             
     except Exception as e:
         logger.error(f"Error in cleanup_old_data: {e}")
+
+@tasks.loop(hours=24)
+async def cleanup_task():
+    """Daily cleanup task loop"""
+    await cleanup_old_data()
 
 async def close_db():
     """Close the database connection pool"""
     global pool
     if pool:
         await pool.close()
+        pool = None
         logger.info("Database connection pool closed")

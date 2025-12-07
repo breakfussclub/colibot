@@ -10,7 +10,7 @@ from bs4 import BeautifulSoup
 
 # Import new modules
 from config import Config
-from database import init_db, save_thread_snapshot, get_trending_from_db, cleanup_old_data, close_db
+from database import init_db, save_thread_snapshot, get_trending_from_db, cleanup_task, close_db
 from scraper import ForumScraper
 from utils import create_trending_embed, create_newest_embed
 
@@ -69,28 +69,38 @@ async def on_ready():
     logger.info(f'Time filter: Last {Config.TIME_FILTER_HOURS} hours')
     logger.info(f'Monitoring forums: {Config.FORUM_URLS}')
     
+    # Verify database connection before starting
+    try:
+        await init_db()
+        test = await get_trending_from_db(1, 1)
+        logger.info("Database connection verified")
+    except Exception as e:
+        logger.critical(f"Database initialization failed: {e}")
+        await bot.close()
+        return
+    
     # Sync slash commands to the guild
     guild = discord.Object(id=Config.GUILD_ID)
     tree.copy_global_to(guild=guild)
     await tree.sync(guild=guild)
     logger.info(f'Slash commands synced to guild {Config.GUILD_ID}')
     
+    # Start background tasks
     if not scheduled_posts.is_running():
         scheduled_posts.start()
     
-    # Initialize DB and start scraper
-    await init_db()
     if not scheduled_scraper.is_running():
         scheduled_scraper.start()
-    if not cleanup_old_data.is_running():
-        cleanup_old_data.start()
+    
+    if not cleanup_task.is_running():
+        cleanup_task.start()
+        logger.info("Cleanup task started (runs daily)")
 
 @bot.event
-async def close():
-    """Graceful shutdown"""
-    logger.info("Shutting down...")
+async def on_disconnect():
+    """Graceful shutdown handler"""
+    logger.info("Bot disconnecting, closing database...")
     await close_db()
-    await super().close()
 
 @tasks.loop(minutes=1)
 async def scheduled_posts():
@@ -248,7 +258,6 @@ async def search(interaction: discord.Interaction, query: str):
         
         for i, thread in enumerate(threads, 1):
             author = thread.get('author', 'Unknown')
-            # replies = thread.get('replies', 0) # Removed stats since we can't reliably get them from thread view
             
             embed.add_field(
                 name=f"#{i}",
